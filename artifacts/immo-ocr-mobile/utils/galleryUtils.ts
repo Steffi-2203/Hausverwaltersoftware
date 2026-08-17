@@ -52,6 +52,27 @@ export interface NativeDeps {
 
 // ─── Web path ────────────────────────────────────────────────────────────────
 
+/** Maximum file size accepted by the web upload path (15 MB). */
+export const MAX_WEB_FILE_BYTES = 15 * 1024 * 1024; // 15 MB
+
+/**
+ * Validates the size of a file selected via the web file input.
+ *
+ * Returns a human-readable German error message when the file exceeds
+ * `maxBytes` (defaults to MAX_WEB_FILE_BYTES), or `null` when the size
+ * is within the allowed range.
+ */
+export function validateWebFileSize(
+  fileSize: number,
+  maxBytes: number = MAX_WEB_FILE_BYTES,
+): string | null {
+  if (fileSize > maxBytes) {
+    const limitMB = Math.round(maxBytes / (1024 * 1024));
+    return `Die Datei ist zu groß (maximal ${limitMB} MB). Bitte wählen Sie ein kleineres Bild.`;
+  }
+  return null;
+}
+
 /**
  * Called once a FileReader has produced a data URL.
  * Strips the "data:<mime>;base64," prefix, resolves the MIME type,

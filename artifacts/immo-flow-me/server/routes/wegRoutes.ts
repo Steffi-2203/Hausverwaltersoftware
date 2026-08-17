@@ -285,22 +285,23 @@ router.post("/api/weg/owner-votes", async (req: Request, res: Response) => {
     if (!(await checkMutationPermission(req, res))) return;
     if (!ctx.orgId) return res.status(403).json({ error: 'Keine Organisation zugewiesen' });
     const body = objectToCamelCase(req.body);
+
+    // Vorbedingungen prüfen (vor der Transaktion, um unnötige Locks zu vermeiden)
     const vote = await db.select().from(schema.wegVotes).where(eq(schema.wegVotes.id, body.voteId)).limit(1);
     if (!vote.length) return res.status(404).json({ error: "Abstimmung nicht gefunden" });
-    const assembly = await db.select().from(schema.wegAssemblies).where(and(eq(schema.wegAssemblies.id, vote[0].assemblyId), eq(schema.wegAssemblies.organizationId, ctx.orgId))).limit(1);
+    const assembly = await db.select().from(schema.wegAssemblies)
+      .where(and(eq(schema.wegAssemblies.id, vote[0].assemblyId), eq(schema.wegAssemblies.organizationId, ctx.orgId)))
+      .limit(1);
     if (!assembly.length) return res.status(403).json({ error: "Zugriff verweigert" });
-    const [created] = await db.insert(schema.wegOwnerVotes).values(body).returning();
 
-    // Ergebnis nach jeder Stimmänderung neu berechnen und persistieren.
-    // Bei Umlaufbeschlüssen: ein nachträgliches Nein setzt passed=false (§ 24 Abs. 1 WEG 2002).
-    // Fehler werden propagiert (→ 500): Die Stimmabgabe ist gespeichert, aber das
-    // Protokollergebnis wäre inkonsistent. Der Client soll erneut versuchen (Retry-Semantik).
-    // Beim nächsten POST wird der Stimme-Row erneut eingetragen und die Neuberechnung
-    // wiederholt — da letzte Stimme gilt, ist das korrekt.
-    const { calculateVoteResult } = await import("../services/wegVotingService");
-    await calculateVoteResult(body.voteId, ctx.orgId);
+    // Atomare Operation: INSERT Stimme + Ergebnisberechnung in einer einzigen Transaktion.
+    // Schlägt die Berechnung fehl → gesamte Transaktion rollt zurück → Stimme NICHT committed.
+    // Dieses Design behebt den Konsistenzbruch aus dem bisherigen Zwei-Schritt-Ansatz
+    // (INSERT committed, calculateVoteResult fehlschlägt → inkonsistenter Zustand).
+    const { recordOwnerVoteAndCalculate } = await import("../services/wegVotingService");
+    const { createdVote } = await recordOwnerVoteAndCalculate(body, ctx.orgId);
 
-    res.json(objectToSnakeCase(created));
+    res.json(objectToSnakeCase(createdVote));
   } catch (error) {
     console.error("Error creating owner vote:", error);
     res.status(500).json({ error: "Fehler beim Erstellen" });
@@ -691,6 +692,9 @@ router.post("/api/weg/budget-plans/:id/activate", async (req: Request, res: Resp
       for (let month = 1; month <= 12; month++) {
         const faelligAm = `${year}-${String(month).padStart(2, '0')}-${String(dueDay).padStart(2, '0')}`;
 
+        // §31 WEG 2002: Rücklage muss als eigener Posten ausgewiesen werden.
+        // ruecklageMonat wird separat gespeichert; gesamtbetrag enthält ihn weiterhin,
+        // weil der Eigentümer ihn schuldet — er muss aber erkennbar sein.
         const [invoice] = await tx.insert(schema.monthlyInvoices).values({
           unitId: uo.unitId,
           tenantId: null,
@@ -705,6 +709,7 @@ router.post("/api/weg/budget-plans/:id/activate", async (req: Request, res: Resp
           ustSatzMiete: 0,
           ustSatzWasser: 0,
           ust: String(totalUstMonat),
+          ruecklage: String(ruecklageMonat),
           gesamtbetrag: String(Math.round(gesamtMonat * 100) / 100),
           status: 'offen',
           faelligAm,

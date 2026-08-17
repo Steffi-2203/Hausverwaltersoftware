@@ -370,10 +370,54 @@ router.post("/api/vpi/apply", isAuthenticated, requireRole("property_manager", "
       return adj;
     });
 
+    // Audit-Befund V2: §16 Abs.9 MRG verlangt, dass die Mietanpassung dem Mieter
+    // schriftlich mitgeteilt wird. Wir senden die Benachrichtigung per E-Mail.
+    // Fehler beim E-Mail-Versand dürfen die erfolgreiche Anpassung nicht rückgängig machen.
+    const emailWarning = await (async () => {
+      try {
+        const [tenantRow] = await db.select()
+          .from(tenants)
+          .innerJoin(units, eq(tenants.unitId, units.id))
+          .innerJoin(properties, eq(units.propertyId, properties.id))
+          .where(eq(tenants.id, tenantId))
+          .limit(1);
+        const email = (tenantRow as any)?.tenants?.email;
+        if (!email) return 'E-Mail-Adresse des Mieters nicht hinterlegt — Benachrichtigung nicht gesendet';
+        const adjustmentData = await vpiAutomationService.checkVpiAdjustments(profile.organizationId);
+        // Find the matching adjustment by tenantId (just applied, so effectiveDate should match)
+        const matchingAdj = adjustmentData.find(a => a.tenantId === tenantId)
+          ?? {
+            tenantName: `${(tenantRow as any).tenants?.firstName} ${(tenantRow as any).tenants?.lastName}`.trim(),
+            propertyName: (tenantRow as any).properties?.name || '',
+            unitNumber: (tenantRow as any).units?.topNummer || '',
+            currentRent: Number(result.previousRent),
+            newRent: Number(result.newRent),
+            percentageIncrease: Number(result.percentageChange) / 100,
+            baseVpi: Number(result.vpiOld),
+            currentVpi: Number(result.vpiNew),
+            effectiveDate: result.effectiveDate || new Date().toISOString().split('T')[0],
+            schwellenwert: 0.05,
+          };
+        const html = await vpiAutomationService.generateVpiNotificationLetter(matchingAdj);
+        const { sendEmail } = await import('../lib/resend');
+        await sendEmail({
+          to: email,
+          subject: `Mietanpassung ab ${matchingAdj.effectiveDate} – ${matchingAdj.propertyName}`,
+          html,
+          idempotencyKey: `vpi-apply-${tenantId}-${result.id}`,
+        });
+        return undefined; // kein Fehler
+      } catch (emailErr: any) {
+        console.error('[VPI] E-Mail-Versand fehlgeschlagen:', emailErr?.message);
+        return `E-Mail konnte nicht gesendet werden: ${emailErr?.message}`;
+      }
+    })();
+
     res.json({
       success: true,
       message: `VPI-Anpassung erfolgreich angewendet`,
       adjustment: result,
+      ...(emailWarning ? { emailWarning } : {}),
     });
   } catch (error: any) {
     console.error("VPI apply error:", error);

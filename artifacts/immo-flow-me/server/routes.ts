@@ -29,6 +29,7 @@ import heatingSettlementRoutes from "./routes/heatingSettlementRoutes";
 import heatBillingRoutes from "./routes/heatBillingRoutes";
 import richtwertRoutes from "./routes/richtwertRoutes";
 import activityRoutes from "./routes/activityRoutes";
+import incomingInvoiceRoutes from "./routes/incomingInvoiceRoutes";
 import featureRoutes from "./routes/featureRoutes";
 import { registerPushRoutes } from "./routes/pushRoutes";
 import * as demoService from "./services/demoService";
@@ -130,6 +131,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use(heatingSettlementRoutes);
   app.use(heatBillingRoutes);
   app.use(richtwertRoutes);
+  app.use(incomingInvoiceRoutes);
   app.use(ocrRoutes);
   app.use('/api/readonly', readonlyRouter);
   app.use(activityRoutes);
@@ -567,6 +569,106 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.send(xml);
     } catch (error: any) {
       res.status(500).json({ error: error.message || "SEPA export failed" });
+    }
+  });
+
+  // ===== Settlement Finalization (§21 Abs.3 MRG: OP-Kette) =====
+  app.patch("/api/settlements/:id/finalize", isAuthenticated, requireRole('property_manager', 'finance'), async (req: any, res) => {
+    try {
+      const profile = await getProfileFromSession(req);
+      if (!profile?.organizationId) return res.status(400).json({ error: "Keine Organisation" });
+
+      // 1. Settlement laden + Org-Zugehörigkeit prüfen
+      const settRows = await db.select()
+        .from(schema.settlements)
+        .innerJoin(schema.properties, eq(schema.settlements.propertyId, schema.properties.id))
+        .where(and(
+          eq(schema.settlements.id, req.params.id),
+          eq(schema.properties.organizationId, profile.organizationId),
+        ))
+        .limit(1);
+
+      if (!settRows.length) return res.status(404).json({ error: "Abrechnung nicht gefunden" });
+      const { settlements: settlement } = settRows[0] as any;
+
+      if (settlement.status === 'abgeschlossen') {
+        return res.status(409).json({ error: "Abrechnung ist bereits abgeschlossen" });
+      }
+
+      // 2. Detailzeilen laden
+      const details = await db.select()
+        .from(schema.settlementDetails)
+        .where(eq(schema.settlementDetails.settlementId, req.params.id));
+
+      // 3. In Transaktion: Status setzen + OP-Einträge erzeugen
+      const openItemsCreated: string[] = [];
+      await db.transaction(async (tx) => {
+        await tx.update(schema.settlements)
+          .set({ status: 'abgeschlossen', updatedAt: new Date() })
+          .where(eq(schema.settlements.id, req.params.id));
+
+        const today = new Date();
+        const dueDate = new Date(today);
+        dueDate.setDate(dueDate.getDate() + 30);
+        const dueDateStr = dueDate.toISOString().split('T')[0];
+        const nowYear = today.getFullYear();
+        const nowMonth = today.getMonth() + 1;
+
+        for (const detail of details) {
+          const diff = Number(detail.differenz ?? 0);
+          // differenz = vorschuss - ausgabenAnteil
+          // Negative differenz → Mieter hat zu wenig gezahlt → Nachzahlung erforderlich
+          if (diff >= -0.005) continue; // keine Nachzahlung nötig (überbezahlt oder ausgeglichen)
+
+          const nachzahlung = Math.round(Math.abs(diff) * 100) / 100;
+
+          // Einheit für diesen Mieter finden
+          const unitRows = await tx.select()
+            .from(schema.tenants)
+            .where(eq(schema.tenants.id, detail.tenantId))
+            .limit(1);
+          const unitId = unitRows[0]?.unitId;
+          if (!unitId) continue;
+
+          // Offene Position als monthlyInvoice anlegen (§21 Abs.3 MRG)
+          const [opEntry] = await tx.insert(schema.monthlyInvoices).values({
+            unitId,
+            tenantId: detail.tenantId,
+            year: nowYear,
+            month: nowMonth,
+            grundmiete: '0',
+            betriebskosten: String(nachzahlung),
+            heizungskosten: '0',
+            wasserkosten: '0',
+            ust: '0',
+            gesamtbetrag: String(nachzahlung),
+            status: 'offen',
+            faelligAm: dueDateStr,
+            isVacancy: false,
+          }).returning({ id: schema.monthlyInvoices.id });
+
+          if (opEntry?.id) openItemsCreated.push(opEntry.id);
+        }
+
+        await tx.execute(sql`
+          INSERT INTO audit_logs (user_id, table_name, record_id, action, new_data, created_at)
+          VALUES (
+            ${profile.userId || null}, 'settlements', ${req.params.id},
+            'finalize',
+            ${JSON.stringify({ openItemsCreated: openItemsCreated.length, year: settlement.year })}::jsonb,
+            now()
+          )
+        `);
+      });
+
+      res.json({
+        success: true,
+        message: `Abrechnung ${settlement.year} abgeschlossen. ${openItemsCreated.length} Nachzahlungs-OP(s) erstellt.`,
+        openItemsCreated,
+      });
+    } catch (err: any) {
+      console.error("[Settlement] Finalize error:", err);
+      res.status(500).json({ error: err.message || "Fehler beim Abschließen der Abrechnung" });
     }
   });
 

@@ -204,8 +204,21 @@ export class SettlementService {
 
       const key = (expense.distributionKeyId ? keyMap.get(expense.distributionKeyId) : null)
         || orgKeys.find(k => k.keyCode === category)
-        || orgKeys.find(k => k.inputType === 'flaeche')
-        || orgKeys[0];
+        || orgKeys.find(k => k.inputType === 'flaeche');
+
+      // Audit-Befund K5: Stiller Fallback auf orgKeys[0] entfernt.
+      // Ohne expliziten Schlüssel muss die Verteilung fehlschlagen — ein
+      // beliebiger Schlüssel würde zu sachlich falschen Abrechnungen führen,
+      // die erst bei einer Prüfung auffallen. Der Nutzer muss entweder der
+      // Ausgabe direkt einen Schlüssel zuweisen oder einen Flächenschlüssel
+      // als Organisations-Standard anlegen.
+      if (!key) {
+        throw new Error(
+          `Kein Verteilungsschlüssel für Kategorie "${category}" (Ausgabe-ID: ${expense.id}) gefunden. ` +
+          `Bitte der Ausgabe einen Schlüssel zuweisen oder einen Flächenschlüssel ` +
+          `als Organisations-Standard anlegen (Einstellungen → Verteilungsschlüssel).`
+        );
+      }
 
       const keyValues = key ? valuesByKey.get(key.id) : undefined;
       let weights = flaecheWeights;

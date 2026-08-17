@@ -51,7 +51,11 @@ let app: express.Express;
 // ── Seed & Cleanup ───────────────────────────────────────────────────────────
 async function seed() {
   await db.execute(sql`INSERT INTO organizations (id, name) VALUES (${orgId}::uuid,'NVorschr-Org') ON CONFLICT DO NOTHING`);
-  await db.execute(sql`INSERT INTO profiles (id, email, organization_id) VALUES (${userId}::uuid,'nvp@test.at',${orgId}::uuid) ON CONFLICT DO NOTHING`);
+  // E-Mail pro Lauf eindeutig machen — fixe E-Mail würde bei abgebrochenen Läufen
+  // einen ON-CONFLICT-Skip auslösen, sodass userId nicht in profiles landet und
+  // der nachfolgende user_roles-Insert mit FK-Fehler scheitert (siehe memory: test-seed-unique-emails).
+  const uniqueEmail = `nvp-${userId.slice(0, 8)}@test.at`;
+  await db.execute(sql`INSERT INTO profiles (id, email, organization_id) VALUES (${userId}::uuid,${uniqueEmail},${orgId}::uuid) ON CONFLICT DO NOTHING`);
   await db.execute(sql`INSERT INTO user_roles (user_id, role) VALUES (${userId}::uuid,'admin') ON CONFLICT DO NOTHING`);
   await db.execute(sql`
     INSERT INTO properties (id, organization_id, name, address, city, postal_code, management_type)

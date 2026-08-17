@@ -10,6 +10,14 @@
  *   4. processOcr is called exactly once per file
  *   5. resetInput callback is invoked (allows the same file to be re-selected)
  *
+ * Web path — file size guard (validateWebFileSize)
+ *   16. Returns null for files within the limit
+ *   17. Returns a German error message when the file exceeds the limit
+ *   18. Returns null exactly at the limit (boundary: equal is allowed)
+ *   19. Returns an error for a file one byte above the limit
+ *   20. Error message mentions the limit in MB
+ *   21. Custom maxBytes override is respected
+ *
  * Native path (requestAndLaunch)
  *   6.  Permission denied (gallery) → Alert shown, launchImageLibrary NOT called
  *   7.  Alert title contains "Berechtigung erforderlich"
@@ -25,7 +33,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleDataUrl, requestAndLaunch } from '../utils/galleryUtils';
+import { handleDataUrl, requestAndLaunch, validateWebFileSize, MAX_WEB_FILE_BYTES } from '../utils/galleryUtils';
 import type { NativeDeps } from '../utils/galleryUtils';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -129,6 +137,60 @@ describe('handleDataUrl (web file-input path)', () => {
       () => handleDataUrl('data:image/png;base64,abc', 'image/png', async () => {}),
     );
   });
+});
+
+// ─── Web path: validateWebFileSize ───────────────────────────────────────────
+
+describe('validateWebFileSize (web file size guard)', () => {
+
+  it('returns null for a file well within the limit', () => {
+    const result = validateWebFileSize(5 * 1024 * 1024); // 5 MB
+    assert.equal(result, null);
+  });
+
+  it('returns null for a zero-byte file', () => {
+    assert.equal(validateWebFileSize(0), null);
+  });
+
+  it('returns null exactly at the limit (boundary: equal is allowed)', () => {
+    assert.equal(validateWebFileSize(MAX_WEB_FILE_BYTES), null);
+  });
+
+  it('returns a non-null error string for a file one byte above the limit', () => {
+    const result = validateWebFileSize(MAX_WEB_FILE_BYTES + 1);
+    assert.ok(result !== null, 'should return an error message for oversized file');
+    assert.equal(typeof result, 'string');
+  });
+
+  it('error message mentions the limit in MB', () => {
+    const result = validateWebFileSize(MAX_WEB_FILE_BYTES + 1);
+    const limitMB = Math.round(MAX_WEB_FILE_BYTES / (1024 * 1024));
+    assert.ok(
+      result!.includes(`${limitMB} MB`),
+      `Error message should mention "${limitMB} MB", got: ${result}`,
+    );
+  });
+
+  it('error message is in German and contains user-friendly wording', () => {
+    const result = validateWebFileSize(MAX_WEB_FILE_BYTES + 1);
+    assert.ok(
+      result!.toLowerCase().includes('zu groß') || result!.toLowerCase().includes('datei'),
+      `Error message should mention file size problem in German, got: ${result}`,
+    );
+  });
+
+  it('respects a custom maxBytes override — rejects above it', () => {
+    const custom = 1024; // 1 KB
+    const result = validateWebFileSize(custom + 1, custom);
+    assert.ok(result !== null, 'should reject when file exceeds custom limit');
+  });
+
+  it('respects a custom maxBytes override — accepts at or below it', () => {
+    const custom = 1024; // 1 KB
+    assert.equal(validateWebFileSize(custom, custom), null);
+    assert.equal(validateWebFileSize(custom - 1, custom), null);
+  });
+
 });
 
 // ─── Native path: requestAndLaunch ───────────────────────────────────────────

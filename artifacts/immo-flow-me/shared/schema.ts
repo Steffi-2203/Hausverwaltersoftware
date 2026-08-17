@@ -14,7 +14,7 @@ export const userSessions = pgTable("user_sessions", {
 });
 
 export const managementTypeEnum = pgEnum('management_type', ['mietverwaltung', 'weg']);
-export const appRoleEnum = pgEnum('app_role', ['admin', 'property_manager', 'finance', 'viewer', 'tester']);
+export const appRoleEnum = pgEnum('app_role', ['admin', 'property_manager', 'finance', 'viewer', 'tester', 'assistant']);
 export const expenseCategoryEnum = pgEnum('expense_category', ['betriebskosten_umlagefaehig', 'instandhaltung']);
 export const expenseTypeEnum = pgEnum('expense_type', [
   'versicherung', 'grundsteuer', 'muellabfuhr', 'wasser_abwasser', 'heizung',
@@ -388,6 +388,8 @@ export const monthlyInvoices = pgTable("monthly_invoices", {
   runId: uuid("run_id"),
   /** Bereits bezahlter Anteil (bei Status 'teilbezahlt' oder 'bezahlt'). Null = noch nicht gesetzt. */
   paidAmount: numeric("paid_amount", { precision: 10, scale: 2 }),
+  /** WEG §31: Monatlicher Rücklagenbeitrag — separat ausgewiesen (Migration: 20260828_monthly_invoices_ruecklage.sql). */
+  ruecklage: numeric("ruecklage", { precision: 12, scale: 2 }).default('0'),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -2646,3 +2648,35 @@ export const periodLocks = pgTable("period_locks", {
 export const insertPeriodLockSchema = createInsertSchema(periodLocks).omit({ id: true, lockedAt: true });
 export type InsertPeriodLock = z.infer<typeof insertPeriodLockSchema>;
 export type PeriodLock = typeof periodLocks.$inferSelect;
+
+// ====== EINGANGSRECHNUNGEN (Lieferantenrechnungen) ======
+// Tabelle wird per Migration 20260828_incoming_invoices.sql angelegt.
+// amount_gross und vat_amount sind GENERATED ALWAYS AS STORED — nur lesen, nicht schreiben.
+export const incomingInvoices = pgTable("incoming_invoices", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  organizationId: uuid("organization_id").references(() => organizations.id).notNull(),
+  propertyId: uuid("property_id").references(() => properties.id),
+  vendorName: text("vendor_name").notNull(),
+  vendorIban: text("vendor_iban"),
+  invoiceNumber: text("invoice_number"),
+  invoiceDate: date("invoice_date").notNull(),
+  dueDate: date("due_date"),
+  amountNet: numeric("amount_net", { precision: 12, scale: 2 }).notNull(),
+  vatRate: numeric("vat_rate", { precision: 5, scale: 2 }).notNull().default("20"),
+  vatAmount: numeric("vat_amount", { precision: 12, scale: 2 }),   // GENERATED ALWAYS — nur lesen
+  amountGross: numeric("amount_gross", { precision: 12, scale: 2 }), // GENERATED ALWAYS — nur lesen
+  description: text("description").notNull(),
+  category: text("category").notNull().default("sonstige"),
+  status: text("status").notNull().default("offen"),
+  journalEntryId: uuid("journal_entry_id").references(() => journalEntries.id),
+  paidAt: date("paid_at"),
+  paidBy: text("paid_by"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export const insertIncomingInvoiceSchema = createInsertSchema(incomingInvoices)
+  .omit({ id: true, vatAmount: true, amountGross: true, createdAt: true, updatedAt: true });
+export type InsertIncomingInvoice = z.infer<typeof insertIncomingInvoiceSchema>;
+export type IncomingInvoice = typeof incomingInvoices.$inferSelect;

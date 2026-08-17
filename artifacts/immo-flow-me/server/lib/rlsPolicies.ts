@@ -92,6 +92,18 @@ const TABLES_VIA_TENANT = [
   },
 ];
 
+/**
+ * Tabellen, die keinen eigenen organization_id-Spalte haben und deren Org-Zugehörigkeit
+ * über einen JOIN zur Elterntabelle (heating_settlements) ermittelt wird.
+ * Policy: EXISTS-Subquery analog zu portalbezogenen Policies.
+ */
+const TABLES_VIA_HEATING_SETTLEMENT = [
+  {
+    table: "heating_settlement_details",
+    condition: `EXISTS (SELECT 1 FROM heating_settlements hs WHERE hs.id = settlement_id AND hs.organization_id = ${ORG_SETTING})`,
+  },
+];
+
 async function tableExists(client: any, tableName: string): Promise<boolean> {
   const result = await client.query(
     `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)`,
@@ -176,6 +188,7 @@ export async function setupRLS(): Promise<void> {
       ...TABLES_VIA_PROPERTY.map((t) => t.table),
       ...TABLES_VIA_UNIT.map((t) => t.table),
       ...TABLES_VIA_TENANT.map((t) => t.table),
+      ...TABLES_VIA_HEATING_SETTLEMENT.map((t) => t.table),
     ];
 
     // Step 2: Enable RLS on all relevant tables (idempotent).
@@ -213,6 +226,11 @@ export async function setupRLS(): Promise<void> {
     }
 
     for (const { table, condition } of TABLES_VIA_TENANT) {
+      if (!(await tableExists(client, table))) continue;
+      await upsertPolicy(client, table, `org_isolation_${table}`, condition);
+    }
+
+    for (const { table, condition } of TABLES_VIA_HEATING_SETTLEMENT) {
       if (!(await tableExists(client, table))) continue;
       await upsertPolicy(client, table, `org_isolation_${table}`, condition);
     }

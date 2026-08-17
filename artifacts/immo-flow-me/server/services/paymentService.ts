@@ -225,16 +225,94 @@ export class PaymentService {
     tenantId: string; 
     level: number; 
     userId?: string; 
-    note?: string 
+    note?: string;
+    organizationId?: string;
+    outstandingAmount?: number;
   }) {
-    const { tenantId, level, userId, note } = params;
-    
-    await db.execute(sql`
-      INSERT INTO audit_logs (user_id, table_name, record_id, action, new_data, created_at)
-      VALUES (${userId || null}, 'dunning', ${tenantId}, 'create', ${JSON.stringify({ level, note })}::jsonb, now())
-    `);
-    
-    return { success: true, level };
+    const { tenantId, level, userId, note, organizationId, outstandingAmount = 0 } = params;
+
+    // §1333 ABGB: Gläubiger hat Anspruch auf Ersatz des Verzugsschadens.
+    // Mahngebühren und 4% Verzugszinsen müssen im Journal erfasst werden.
+    const DUNNING_FEES: Record<number, number> = { 1: 0, 2: 5, 3: 10 };
+    const mahngebuehr = DUNNING_FEES[level] ?? 0;
+
+    // 4% p.a. Gesetzlicher Verzugszins (§1000 ABGB) auf den offenen Betrag —
+    // für 30 Tage anteilig (vereinfachte Tageszinsformel).
+    const verzugszinsenJahr = roundMoney(outstandingAmount * 0.04);
+    const verzugszinsenMonat = roundMoney(verzugszinsenJahr / 12);
+
+    await db.transaction(async (tx) => {
+      // 1. Audit-Log (bestehend)
+      await tx.execute(sql`
+        INSERT INTO audit_logs (user_id, table_name, record_id, action, new_data, created_at)
+        VALUES (${userId || null}, 'dunning', ${tenantId}, 'create',
+                ${JSON.stringify({ level, note, mahngebuehr, verzugszinsenMonat, outstandingAmount })}::jsonb, now())
+      `);
+
+      // 2. Journal-Buchung für Mahngebühr (§1333 ABGB) — nur bei Stufe 2 und 3
+      if (mahngebuehr > 0 && organizationId) {
+        const bookingDate = new Date().toISOString().split('T')[0];
+        const bookingNumber = `MAHN-${tenantId.slice(0, 6).toUpperCase()}-${Date.now()}`;
+
+        // Journal-Kopf
+        const jeResult = await tx.execute(sql`
+          INSERT INTO journal_entries (
+            organization_id, booking_number, entry_date, description,
+            source_type, source_id, tenant_id, created_by
+          )
+          VALUES (
+            ${organizationId}, ${bookingNumber}, ${bookingDate},
+            ${`Mahnstufe ${level}: Mahngebühr gem. §1333 ABGB`},
+            'dunning', ${tenantId}, ${tenantId}, ${userId || null}
+          )
+          RETURNING id
+        `);
+        const jeId = (jeResult.rows?.[0] as any)?.id;
+
+        if (jeId) {
+          // Soll: Forderung an Mieter (Konto 2000 Mieter-Forderungen oder System-Standard)
+          // Haben: Mahngebührenertrag (Konto 8300 oder System-Standard)
+          // Wir suchen die Standardkonten; existieren sie nicht, loggen wir nur.
+          await tx.execute(sql`
+            INSERT INTO journal_entry_lines (journal_entry_id, account_id, debit, credit, description)
+            SELECT ${jeId}, coa.id, ${mahngebuehr}, 0,
+                   ${`Mahngebühr Stufe ${level} — Mieter ${tenantId.slice(0, 8)}`}
+            FROM chart_of_accounts coa
+            WHERE coa.organization_id = ${organizationId}
+              AND (coa.account_number = '2000' OR coa.name ILIKE '%mieter%forder%')
+            LIMIT 1
+          `);
+          await tx.execute(sql`
+            INSERT INTO journal_entry_lines (journal_entry_id, account_id, debit, credit, description)
+            SELECT ${jeId}, coa.id, 0, ${mahngebuehr},
+                   ${`Mahngebühr Ertrag Stufe ${level}`}
+            FROM chart_of_accounts coa
+            WHERE coa.organization_id = ${organizationId}
+              AND (coa.account_number LIKE '83%' OR coa.name ILIKE '%mahn%' OR coa.name ILIKE '%gebühr%')
+            LIMIT 1
+          `);
+        }
+      }
+
+      // 3. Journal-Buchung für Verzugszinsen (4% p.a. gem. §1000 ABGB) — ab Stufe 2
+      if (verzugszinsenMonat > 0 && organizationId && level >= 2) {
+        const bookingDate = new Date().toISOString().split('T')[0];
+        const zinsNumber = `ZINS-${tenantId.slice(0, 6).toUpperCase()}-${Date.now()}`;
+        await tx.execute(sql`
+          INSERT INTO journal_entries (
+            organization_id, booking_number, entry_date, description,
+            source_type, source_id, tenant_id, created_by
+          )
+          VALUES (
+            ${organizationId}, ${zinsNumber}, ${bookingDate},
+            ${`Verzugszinsen 4% p.a. gem. §1000 ABGB (${verzugszinsenMonat.toFixed(2)} €/Monat)`},
+            'dunning_interest', ${tenantId}, ${tenantId}, ${userId || null}
+          )
+        `);
+      }
+    });
+
+    return { success: true, level, mahngebuehr, verzugszinsenMonat };
   }
 
   async getTenantsForDunning(organizationId: string, minDaysOverdue: number = 14): Promise<DunningResult[]> {

@@ -16,7 +16,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Haptics from 'expo-haptics';
 import { Feather, Ionicons } from '@expo/vector-icons';
 import { useAuth, type ScanResult } from '@/context/AuthContext';
-import { handleDataUrl } from '@/utils/galleryUtils';
+import { handleDataUrl, validateWebFileSize } from '@/utils/galleryUtils';
 import { openGallery as _openGallery, openCamera as _openCamera } from '@/utils/scanActions';
 import type { NativeDeps } from '@/utils/galleryUtils';
 
@@ -50,6 +50,12 @@ export default function ScanScreen() {
     return (e: any) => {
       const file: File | undefined = e.target?.files?.[0];
       if (!file) return;
+      const sizeError = validateWebFileSize(file.size);
+      if (sizeError) {
+        Alert.alert('Datei zu groß', sizeError);
+        if (inputRef.current) inputRef.current.value = '';
+        return;
+      }
       const reader = new FileReader();
       reader.onerror = () => {
         Alert.alert('Fehler', 'Bild konnte nicht gelesen werden.');

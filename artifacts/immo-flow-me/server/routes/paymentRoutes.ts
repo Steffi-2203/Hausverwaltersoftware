@@ -123,6 +123,7 @@ router.post("/api/payments", isAuthenticated, requireRole('property_manager', 'f
       });
     } catch {}
     
+    let allocationWarning: string | undefined;
     try {
       await paymentService.allocatePayment({
         paymentId: payment.id,
@@ -133,11 +134,17 @@ router.post("/api/payments", isAuthenticated, requireRole('property_manager', 'f
         reference: payment.verwendungszweck || undefined,
         organizationId: profile?.organizationId,
       });
-    } catch (allocError) {
-      console.error("Payment allocation error (non-critical):", allocError);
+    } catch (allocError: any) {
+      // Audit-Befund Z1: Fehlgeschlagene Zuordnung nicht still verschlucken.
+      // Die Zahlung ist gespeichert, aber die Rechnungen wurden nicht aktualisiert.
+      // Wir protokollieren den Fehler und signalisieren ihn dem Frontend,
+      // damit der Verwalter manuell eingreifen kann.
+      const msg = (allocError as Error)?.message || String(allocError);
+      console.error("[Payment] Zahlungszuordnung fehlgeschlagen:", msg, { paymentId: payment.id });
+      allocationWarning = `Zahlung gespeichert, Zuordnung fehlgeschlagen: ${msg}`;
     }
-    
-    res.json(payment);
+
+    res.json({ ...payment, allocationWarning });
   } catch (error) {
     console.error("Create payment error:", error);
     res.status(500).json({ error: "Failed to create payment" });

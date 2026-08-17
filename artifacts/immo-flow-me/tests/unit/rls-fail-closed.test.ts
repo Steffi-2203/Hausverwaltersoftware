@@ -105,6 +105,8 @@ const ORG_A_ID = randomUUID();
 const ORG_B_ID = randomUUID();
 const PROP_A_ID = randomUUID();
 const PROP_B_ID = randomUUID();
+const UNIT_B_ID = randomUUID();
+let SETTLEMENT_B_ID: number; // serial — vom Insert zurückgegeben
 
 before(async () => {
   // Superuser fügt Fixtures ein — außerhalb von RLS, damit der Test sauber aufgesetzt ist.
@@ -122,11 +124,44 @@ before(async () => {
              ($3, $4, 'Prop B', 'Addr B', 'Wien', '1010', 'mietverwaltung')
       ON CONFLICT (id) DO NOTHING
     `, [PROP_A_ID, ORG_A_ID, PROP_B_ID, ORG_B_ID]);
+
+    // Unit für Prop B damit heating_settlement_details.unit_id NOT NULL erfüllt ist.
+    await client.query(`
+      INSERT INTO units (id, property_id, top_nummer, type, status, stockwerk, zimmer, flaeche, created_at)
+      VALUES ($1, $2, 'RLS-B1', 'wohnung', 'aktiv', 1, 2, 60.0, NOW())
+      ON CONFLICT (id) DO NOTHING
+    `, [UNIT_B_ID, PROP_B_ID]);
+
+    // heating_settlement_details: Org B hat eine Abrechnung mit einer Detailzeile.
+    const settlRes = await client.query(`
+      INSERT INTO heating_settlements
+        (organization_id, property_id, period_start, period_end, total_cost,
+         fixed_cost_share, variable_cost_share, status, created_at)
+      VALUES ($1, $2, '2025-01-01', '2025-12-31', 8000.00, 40, 60, 'entwurf', NOW())
+      RETURNING id
+    `, [ORG_B_ID, PROP_B_ID]);
+    SETTLEMENT_B_ID = Number(settlRes.rows[0].id);
+
+    await client.query(`
+      INSERT INTO heating_settlement_details
+        (settlement_id, unit_id, tenant_name, area, consumption,
+         fixed_amount, variable_amount, total_amount, prepayment, balance)
+      VALUES ($1, $2, 'RLS-Mieter B', 60.0, 900.0, 3200.00, 4800.00, 8000.00, 7000.00, 1000.00)
+    `, [SETTLEMENT_B_ID, UNIT_B_ID]);
   });
 });
 
 after(async () => {
   await withSuperClient(async (client) => {
+    await client.query(
+      `DELETE FROM heating_settlement_details WHERE settlement_id = $1`,
+      [SETTLEMENT_B_ID]
+    ).catch(() => {});
+    await client.query(
+      `DELETE FROM heating_settlements WHERE id = $1`,
+      [SETTLEMENT_B_ID]
+    ).catch(() => {});
+    await client.query(`DELETE FROM units WHERE id = $1`, [UNIT_B_ID]).catch(() => {});
     await client.query(`DELETE FROM properties WHERE id IN ($1, $2)`, [PROP_A_ID, PROP_B_ID]);
     await client.query(`DELETE FROM organizations WHERE id IN ($1, $2)`, [ORG_A_ID, ORG_B_ID]);
   });
@@ -282,5 +317,85 @@ describe("RLS: organizations bleibt org-übergreifend lesbar (excluded from RLS)
     );
     assert.equal(parseInt(result.rows[0].cnt, 10), 2,
       "organizations ist von RLS ausgeschlossen und muss immer lesbar sein");
+  });
+});
+
+describe("RLS heating_settlement_details: fail-closed via JOIN auf heating_settlements", () => {
+  test("ohne Org-Kontext → 0 Detailzeilen sichtbar (fail-closed)", async () => {
+    let error: Error | null = null;
+    let cnt = -1;
+    try {
+      const result = await withNoOrg((client) =>
+        client.query(
+          `SELECT COUNT(*) AS cnt FROM heating_settlement_details WHERE settlement_id = $1`,
+          [SETTLEMENT_B_ID]
+        )
+      );
+      cnt = parseInt(result.rows[0].cnt, 10);
+    } catch (e: any) {
+      error = e;
+    }
+    assert.equal(error, null, `Kein Fehler erwartet, aber: ${error?.message}`);
+    assert.equal(cnt, 0, "Ohne Org-Kontext darf immo_app keine Detailzeilen sehen");
+  });
+
+  test("Org-A-Kontext → Detailzeilen von Org B nicht sichtbar (Isolation)", async () => {
+    const result = await withOrg(ORG_A_ID, (client) =>
+      client.query(
+        `SELECT COUNT(*) AS cnt FROM heating_settlement_details WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    assert.equal(parseInt(result.rows[0].cnt, 10), 0,
+      "Org-A-Kontext darf Detailzeilen von Org B nicht sehen");
+  });
+
+  test("Org-B-Kontext → eigene Detailzeilen sichtbar", async () => {
+    const result = await withOrg(ORG_B_ID, (client) =>
+      client.query(
+        `SELECT COUNT(*) AS cnt FROM heating_settlement_details WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    assert.equal(parseInt(result.rows[0].cnt, 10), 1,
+      "Org-B-Kontext muss die eigene Detailzeile sehen");
+  });
+
+  test("Org-A-Kontext: DELETE auf Detailzeilen von Org B → 0 gelöschte Zeilen", async () => {
+    await withOrg(ORG_A_ID, (client) =>
+      client.query(
+        `DELETE FROM heating_settlement_details WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    // Superuser prüft: Zeile noch vorhanden
+    const result = await withSuperClient((client) =>
+      client.query(
+        `SELECT COUNT(*) AS cnt FROM heating_settlement_details WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    assert.equal(parseInt(result.rows[0].cnt, 10), 1,
+      "RLS muss DELETE auf fremde Detailzeilen verhindern — Zeile muss noch existieren");
+  });
+
+  test("Org-A-Kontext: UPDATE auf Detailzeilen von Org B → keine Änderung", async () => {
+    await withOrg(ORG_A_ID, (client) =>
+      client.query(
+        `UPDATE heating_settlement_details SET consumption = 9999 WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    const result = await withSuperClient((client) =>
+      client.query(
+        `SELECT consumption FROM heating_settlement_details WHERE settlement_id = $1`,
+        [SETTLEMENT_B_ID]
+      )
+    );
+    assert.equal(result.rows.length, 1, "Zeile muss noch existieren");
+    assert.notEqual(
+      Number(result.rows[0].consumption), 9999,
+      "RLS muss UPDATE auf fremde Detailzeilen verhindern — consumption darf nicht 9999 sein"
+    );
   });
 });

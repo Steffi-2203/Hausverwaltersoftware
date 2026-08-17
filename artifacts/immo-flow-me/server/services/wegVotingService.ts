@@ -1,6 +1,6 @@
 import { rootDb as db } from "../db"; // direkt aufgerufene Service-Fns brauchen keinen RLS-Proxy
 import { eq, and, asc, inArray } from "drizzle-orm";
-import { wegVotes, wegOwnerVotes, wegUnitOwners, wegAssemblies, wegVoteResults, profiles, userRoles } from "@shared/schema";
+import { wegVotes, wegOwnerVotes, wegUnitOwners, wegAssemblies, wegVoteResults, profiles, userRoles, type InsertWegOwnerVote, type WegOwnerVote } from "@shared/schema";
 
 // ─── Reine Berechnungshelfer — exportiert für Unit-Tests ──────────────────────
 
@@ -265,272 +265,284 @@ async function notifyManagersOfInvalidation(opts: {
   }
 }
 
+// ─── Interne Typen ────────────────────────────────────────────────────────────
+
+/** Daten für die Invalidierungs-E-Mail — gesammelt IN der Transaktion, gesendet NACH dem Commit. */
+interface PendingInvalidationData {
+  organizationId: string;
+  voteId: string;
+  voteTopic: string;
+  invalidationWarning: string;
+}
+
+// ─── Interne Hilfsfunktion: Berechnung + UPSERT in einer caller-supplied Tx ──
+/**
+ * Führt die vollständige Stimmauswertung und den UPSERT in `weg_vote_results`
+ * innerhalb einer BEREITS GEÖFFNETEN Transaktion durch.
+ *
+ * Design-Entscheidung: Kein try/catch um den UPSERT — Fehler sollen die
+ * Transaktion des Aufrufers zurückrollen. So können INSERT + Berechnung
+ * atomar sein (recordOwnerVoteAndCalculate), ohne dass Persistenzfehler
+ * stillschweigend verschluckt werden.
+ *
+ * @param tx   Drizzle-Transaktionsobjekt des Aufrufers
+ * @param voteId  UUID der Abstimmung (aus weg_votes)
+ * @param organizationId  Org-ID zur Zugehörigkeitsprüfung
+ */
+async function _runVoteCalculationAndPersist(
+  tx: any,
+  voteId: string,
+  organizationId: string,
+): Promise<{ result: VoteResult; invalidationData?: PendingInvalidationData }> {
+  // ── Row-Lock auf die Abstimmungszeile ─────────────────────────────────────────
+  // SELECT FOR UPDATE serialisiert alle gleichzeitigen calculateVoteResult()-Aufrufe
+  // für dieselbe voteId — alle anderen warten am Lock bis die tx committed hat.
+  const [vote] = await tx
+    .select()
+    .from(wegVotes)
+    .where(eq(wegVotes.id, voteId))
+    .for('update');
+  if (!vote) throw new Error("Abstimmung nicht gefunden");
+
+  const assembly = await tx.select().from(wegAssemblies)
+    .where(and(eq(wegAssemblies.id, vote.assemblyId), eq(wegAssemblies.organizationId, organizationId)))
+    .limit(1);
+  if (!assembly.length) throw new Error("Versammlung gehört nicht zu dieser Organisation");
+
+  // ── Eigentümer der Liegenschaft (de-dupliziert nach ownerId) ─────────────────
+  const propertyId = assembly[0].propertyId;
+  const ownerRows = await tx.select().from(wegUnitOwners)
+    .where(and(
+      eq(wegUnitOwners.organizationId, organizationId),
+      eq(wegUnitOwners.propertyId, propertyId),
+    ));
+  const uniqueOwners = new Map<string, typeof ownerRows[0]>();
+  for (const o of ownerRows) uniqueOwners.set(o.ownerId, o);
+  const totalMeaShares = Array.from(uniqueOwners.values()).reduce((sum, o) => sum + Number(o.meaShare), 0);
+  const totalOwnerCount = uniqueOwners.size;
+
+  // ── Alle Stimmen laden (ORDER BY createdAt ASC → letzte Stimme gewinnt) ──────
+  const ownerVotes = await tx.select().from(wegOwnerVotes)
+    .where(eq(wegOwnerVotes.voteId, voteId))
+    .orderBy(asc(wegOwnerVotes.createdAt));
+
+  // ── MEA-Anteilsmehrheit + Kopfmehrheit ────────────────────────────────────────
+  let yesShares = 0, noShares = 0, abstainShares = 0;
+  let yesCount = 0, noCount = 0, abstainCount = 0;
+
+  // De-duplicate: letzte Stimme pro Eigentümer zählt (Late-Override-Prinzip).
+  const latestVoteByOwner = new Map<string, typeof ownerVotes[0]>();
+  for (const ov of ownerVotes) latestVoteByOwner.set(ov.ownerId, ov);
+
+  for (const [, ov] of latestVoteByOwner) {
+    const owner = uniqueOwners.get(ov.ownerId);
+    if (!owner) continue;
+    const share = Number(owner.meaShare);
+    if (ov.voteValue === 'ja')          { yesShares += share; yesCount++; }
+    else if (ov.voteValue === 'nein')   { noShares  += share; noCount++;  }
+    else                                 { abstainShares += share; abstainCount++; }
+  }
+
+  // ── Quorum (MEA > 50%) ────────────────────────────────────────────────────────
+  const votedMeaShares = yesShares + noShares + abstainShares;
+  const quorumPercent  = totalMeaShares > 0 ? (votedMeaShares / totalMeaShares) * 100 : 0;
+  const quorumReached  = quorumPercent > 50;
+
+  // ── Umlaufbeschluss-Erkennung (§ 24 Abs. 1 WEG 2002) ─────────────────────────
+  const isUmlauf = vote.voteType === 'umlauf' || vote.isCircularVote === true;
+
+  // ── Mehrheitsberechnung ───────────────────────────────────────────────────────
+  const requiredMajority = isUmlauf ? 'einstimmig' : (vote.requiredMajority || 'einfach');
+  const yesPercent       = votedMeaShares > 0 ? (yesShares / votedMeaShares) * 100 : 0;
+  let majorityReached    = false;
+
+  if (isUmlauf) {
+    majorityReached = yesCount === totalOwnerCount && noCount === 0 && abstainCount === 0 && totalOwnerCount > 0;
+  } else {
+    switch (requiredMajority) {
+      case 'einfach':    majorityReached = yesShares > noShares; break;
+      case 'zweidrittel':
+        // 3 × yesShares ≥ 2 × votedMeaShares = ≥ ⅔ ohne Float-Drift; votedMeaShares > 0 verhindert 0≥0.
+        majorityReached = votedMeaShares > 0 && 3 * yesShares >= 2 * votedMeaShares; break;
+      case 'einstimmig': majorityReached = noShares === 0 && yesShares > 0; break;
+      default:           majorityReached = yesShares > noShares;
+    }
+  }
+
+  // ── Ergebnistext ─────────────────────────────────────────────────────────────
+  let resultText = '';
+  if (isUmlauf) {
+    const missingCount = Math.max(0, totalOwnerCount - yesCount - noCount - abstainCount);
+    if (majorityReached) {
+      resultText = `Umlaufbeschluss angenommen: Alle ${totalOwnerCount} Eigentümer haben zugestimmt (§ 24 Abs. 1 WEG 2002)`;
+    } else if (noCount > 0) {
+      resultText = `Umlaufbeschluss abgelehnt: ${noCount} Nein-Stimme(n) – Einstimmigkeit erforderlich (§ 24 Abs. 1 WEG 2002)`;
+    } else if (abstainCount > 0) {
+      resultText = `Umlaufbeschluss abgelehnt: ${abstainCount} Enthaltung(en) – Alle Eigentümer müssen aktiv zustimmen (§ 24 Abs. 1 WEG 2002)`;
+    } else {
+      resultText = `Umlaufbeschluss ausstehend: ${yesCount} von ${totalOwnerCount} Eigentümern haben zugestimmt${missingCount > 0 ? `, ${missingCount} fehlen noch` : ''}`;
+    }
+  } else if (!quorumReached) {
+    resultText = `Beschlussunfähig: Quorum nicht erreicht (${quorumPercent.toFixed(1)}% der MEA-Anteile anwesend, >50% erforderlich)`;
+  } else if (majorityReached) {
+    resultText = `Angenommen: ${yesPercent.toFixed(1)}% Ja-Stimmen nach MEA-Anteil (${requiredMajority} Mehrheit erreicht)`;
+  } else {
+    resultText = `Abgelehnt: ${yesPercent.toFixed(1)}% Ja-Stimmen nach MEA-Anteil (${requiredMajority} Mehrheit nicht erreicht)`;
+  }
+
+  // ── Kopfmehrheit (§ 25 Abs. 1 WEG 2002) ─────────────────────────────────────
+  const votedCount         = yesCount + noCount + abstainCount;
+  const kopfMajorityReached = yesCount > noCount && votedCount > 0;
+  const kopfYesPercent     = votedCount > 0 ? (yesCount / votedCount) * 100 : 0;
+
+  let kopfResultText = '';
+  if (votedCount === 0) {
+    kopfResultText = 'Kopfmehrheit: Keine Stimmen abgegeben';
+  } else if (kopfMajorityReached) {
+    kopfResultText = `Kopfmehrheit: Angenommen — ${yesCount} von ${votedCount} Eigentümern (${kopfYesPercent.toFixed(1)}% Ja)`;
+  } else {
+    kopfResultText = `Kopfmehrheit: Abgelehnt — ${yesCount} von ${votedCount} Eigentümern (${kopfYesPercent.toFixed(1)}% Ja)`;
+  }
+
+  // ── Invalidierungs-Erkennung (passed=true → false flip) ──────────────────────
+  const newPassed = isUmlauf ? majorityReached : (majorityReached && quorumReached);
+  let invalidationWarning: string | undefined;
+  let invalidationData: PendingInvalidationData | undefined;
+
+  if (isUmlauf && !newPassed) {
+    // Lese vorherigen Zustand IN der Transaktion (vor unserem UPSERT = letzter committed Wert).
+    const [prevResult] = await tx
+      .select({ passed: wegVoteResults.passed })
+      .from(wegVoteResults)
+      .where(eq(wegVoteResults.voteId, voteId));
+
+    if (prevResult?.passed === true) {
+      const flipReason = noCount > 0
+        ? `${noCount} nachträgliche(r) Nein-Stimme(n)`
+        : `${abstainCount} nachträgliche(r) Enthaltung(en)`;
+      invalidationWarning =
+        `ACHTUNG: Dieser Umlaufbeschluss war zuvor als angenommen protokolliert und wurde ` +
+        `durch ${flipReason} nachträglich ungültig (§ 24 Abs. 1 WEG 2002). ` +
+        `Bitte das Protokoll berichtigen und alle Beteiligten informieren.`;
+      // E-Mail-Daten für den Aufrufer — gesendet NACH dem Commit (nicht in der Tx).
+      invalidationData = { organizationId, voteId, voteTopic: vote.topic, invalidationWarning };
+    }
+  }
+
+  const result: VoteResult = {
+    voteId,
+    totalMeaShares, votedMeaShares, quorumReached, quorumPercent,
+    yesShares, noShares, abstainShares,
+    majorityReached, requiredMajority, resultText,
+    totalOwnerCount, yesCount, noCount, abstainCount,
+    kopfMajorityReached, kopfResultText,
+    ...(invalidationWarning ? { invalidationWarning } : {}),
+  };
+
+  // ── UPSERT Ergebnis ───────────────────────────────────────────────────────────
+  // Kein try/catch: Fehler hier sollen die Transaktion des Aufrufers zurückrollen.
+  // Beim atomaren recordOwnerVoteAndCalculate() bedeutet das: auch der vote-INSERT
+  // wird zurückgerollt → konsistenter Zustand.
+  const upsertValues = {
+    voteId,
+    passed: newPassed,
+    quorumReached,
+    yesShares:     yesShares.toString() as any,
+    noShares:      noShares.toString() as any,
+    abstainShares: abstainShares.toString() as any,
+    yesCount, noCount, abstainCount,
+    resultText, kopfMajorityReached, kopfResultText,
+    ...(invalidationWarning ? { invalidationWarning } : {}),
+  };
+  await tx.insert(wegVoteResults).values(upsertValues).onConflictDoUpdate({
+    target: wegVoteResults.voteId,
+    set: {
+      ...upsertValues,
+      calculatedAt: new Date(),
+    },
+  });
+
+  return { result, invalidationData };
+}
+
+// ─── Öffentliche API ──────────────────────────────────────────────────────────
+
 export async function calculateVoteResult(
   voteId: string,
   organizationId: string,
   sendEmailFn?: SendEmailFn,
 ): Promise<VoteResult> {
-  // Collected outside the transaction so the email is sent AFTER the tx
-  // commits — avoids holding the row lock during potentially slow SMTP I/O.
-  let pendingInvalidationEmail: {
-    organizationId: string;
-    voteId: string;
-    voteTopic: string;
-    invalidationWarning: string;
-    sendEmailFn: SendEmailFn;
-  } | undefined;
+  // E-Mail wird NACH dem Commit gesendet — nicht in der Tx (vermeidet SMTP-Latenz am Row-Lock).
+  let invalidationData: PendingInvalidationData | undefined;
 
-  // ─── Serialisierung über SELECT FOR UPDATE ───────────────────────────────────
-  // Bei gleichzeitigen Stimmabgaben können mehrere calculateVoteResult()-Aufrufe
-  // parallel laufen. SELECT FOR UPDATE auf die wegVotes-Zeile stellt sicher,
-  // dass jeweils nur eine Berechnung pro Abstimmung läuft — alle anderen warten
-  // am Lock, bis die laufende Transaktion committed hat und das aktuelle
-  // Stimmbild sichtbar wird. Dies verhindert inkonsistente UPSERT-Ergebnisse.
+  // ─── Serialisierung über SELECT FOR UPDATE (in _runVoteCalculationAndPersist) ──
   const result = await db.transaction(async (tx) => {
-    // Row-Lock auf die Abstimmungszeile — serialisiert alle gleichzeitigen
-    // calculateVoteResult()-Aufrufe für dieselbe voteId.
-    const [vote] = await tx
-      .select()
-      .from(wegVotes)
-      .where(eq(wegVotes.id, voteId))
-      .for('update');
-    if (!vote) throw new Error("Abstimmung nicht gefunden");
-
-    const assembly = await tx.select().from(wegAssemblies)
-      .where(and(eq(wegAssemblies.id, vote.assemblyId), eq(wegAssemblies.organizationId, organizationId)))
-      .limit(1);
-    if (!assembly.length) throw new Error("Versammlung gehört nicht zu dieser Organisation");
-
-    // Eigentümer auf die Liegenschaft der Versammlung eingrenzen, nicht alle Org-Eigentümer.
-    // Deduplication nach ownerId: Ein Eigentümer mit mehreren Einheiten zählt nur einmal.
-    const propertyId = assembly[0].propertyId;
-    const ownerRows = await tx.select().from(wegUnitOwners)
-      .where(and(
-        eq(wegUnitOwners.organizationId, organizationId),
-        eq(wegUnitOwners.propertyId, propertyId),
-      ));
-    const uniqueOwners = new Map<string, typeof ownerRows[0]>();
-    for (const o of ownerRows) uniqueOwners.set(o.ownerId, o);
-    const totalMeaShares = Array.from(uniqueOwners.values()).reduce((sum, o) => sum + Number(o.meaShare), 0);
-    const totalOwnerCount = uniqueOwners.size;
-
-    // ORDER BY createdAt ASC ist zwingend: ohne Sortierung ist die Reihenfolge in
-    // PostgreSQL undefiniert. Die Map überschreibt frühere Einträge desselben
-    // Eigentümers — letzte Stimme (chronologisch) gewinnt (Late-Override-Prinzip).
-    const ownerVotes = await tx.select().from(wegOwnerVotes)
-      .where(eq(wegOwnerVotes.voteId, voteId))
-      .orderBy(asc(wegOwnerVotes.createdAt));
-
-    // ─── MEA-Anteilsmehrheit ────────────────────────────────────────────────────
-    let yesShares = 0, noShares = 0, abstainShares = 0;
-    // ─── Kopfmehrheit ───────────────────────────────────────────────────────────
-    let yesCount = 0, noCount = 0, abstainCount = 0;
-
-    // De-duplicate: each owner votes once (take last recorded vote per owner).
-    // Da die Abfrage ASC nach createdAt sortiert ist, überschreibt die Map
-    // ältere Einträge — die LETZTE Stimme des Eigentümers bleibt stehen.
-    const latestVoteByOwner = new Map<string, typeof ownerVotes[0]>();
-    for (const ov of ownerVotes) {
-      latestVoteByOwner.set(ov.ownerId, ov);
-    }
-
-    for (const [, ov] of latestVoteByOwner) {
-      const owner = uniqueOwners.get(ov.ownerId);
-      if (!owner) continue;
-      const share = Number(owner.meaShare);
-
-      if (ov.voteValue === 'ja') {
-        yesShares += share;
-        yesCount++;
-      } else if (ov.voteValue === 'nein') {
-        noShares += share;
-        noCount++;
-      } else {
-        abstainShares += share;
-        abstainCount++;
-      }
-    }
-
-    // ─── Quorum (MEA > 50%) ─────────────────────────────────────────────────────
-    const votedMeaShares = yesShares + noShares + abstainShares;
-    const quorumPercent = totalMeaShares > 0 ? (votedMeaShares / totalMeaShares) * 100 : 0;
-    const quorumReached = quorumPercent > 50;
-
-    // ─── Umlaufbeschluss (§ 24 Abs. 1 WEG 2002): Einstimmigkeit ALLER Eigentümer ──
-    // Auch legacy-Einträge mit isCircularVote=true werden als Umlauf gewertet.
-    const isUmlauf = vote.voteType === 'umlauf' || vote.isCircularVote === true;
-
-    // ─── Anteilsmehrheit ────────────────────────────────────────────────────────
-    const requiredMajority = isUmlauf ? 'einstimmig' : (vote.requiredMajority || 'einfach');
-    let majorityReached = false;
-    const yesPercent = votedMeaShares > 0 ? (yesShares / votedMeaShares) * 100 : 0;
-
-    if (isUmlauf) {
-      // § 24 Abs. 1 WEG: Alle Miteigentümer müssen schriftlich zustimmen.
-      // noCount = 0 UND abstainCount = 0 UND yesCount = alle Eigentümer.
-      majorityReached = yesCount === totalOwnerCount && noCount === 0 && abstainCount === 0 && totalOwnerCount > 0;
-    } else {
-      switch (requiredMajority) {
-        case 'einfach':
-          majorityReached = yesShares > noShares;
-          break;
-        case 'zweidrittel':
-          // Ganzzahl-Vergleich: 3 × yesShares ≥ 2 × votedMeaShares entspricht ≥ ⅔ ohne Float-Drift.
-          // votedMeaShares > 0 verhindert dass 0 ≥ 0 (true) bei Null-Beteiligung fälschlich true ergibt.
-          majorityReached = votedMeaShares > 0 && 3 * yesShares >= 2 * votedMeaShares;
-          break;
-        case 'einstimmig':
-          majorityReached = noShares === 0 && yesShares > 0;
-          break;
-        default:
-          majorityReached = yesShares > noShares;
-      }
-    }
-
-    let resultText = '';
-    if (isUmlauf) {
-      const missingCount = Math.max(0, totalOwnerCount - yesCount - noCount - abstainCount);
-      if (majorityReached) {
-        resultText = `Umlaufbeschluss angenommen: Alle ${totalOwnerCount} Eigentümer haben zugestimmt (§ 24 Abs. 1 WEG 2002)`;
-      } else if (noCount > 0) {
-        resultText = `Umlaufbeschluss abgelehnt: ${noCount} Nein-Stimme(n) – Einstimmigkeit erforderlich (§ 24 Abs. 1 WEG 2002)`;
-      } else if (abstainCount > 0) {
-        resultText = `Umlaufbeschluss abgelehnt: ${abstainCount} Enthaltung(en) – Alle Eigentümer müssen aktiv zustimmen (§ 24 Abs. 1 WEG 2002)`;
-      } else {
-        resultText = `Umlaufbeschluss ausstehend: ${yesCount} von ${totalOwnerCount} Eigentümern haben zugestimmt${missingCount > 0 ? `, ${missingCount} fehlen noch` : ''}`;
-      }
-    } else if (!quorumReached) {
-      resultText = `Beschlussunfähig: Quorum nicht erreicht (${quorumPercent.toFixed(1)}% der MEA-Anteile anwesend, >50% erforderlich)`;
-    } else if (majorityReached) {
-      resultText = `Angenommen: ${yesPercent.toFixed(1)}% Ja-Stimmen nach MEA-Anteil (${requiredMajority} Mehrheit erreicht)`;
-    } else {
-      resultText = `Abgelehnt: ${yesPercent.toFixed(1)}% Ja-Stimmen nach MEA-Anteil (${requiredMajority} Mehrheit nicht erreicht)`;
-    }
-
-    // ─── Kopfmehrheit (§ 25 Abs. 1 WEG 2002) ───────────────────────────────────
-    // Einfache Personenmehrheit: mehr Ja- als Nein-Stimmen nach Kopfzahl
-    const votedCount = yesCount + noCount + abstainCount;
-    const kopfMajorityReached = yesCount > noCount && votedCount > 0;
-    const kopfYesPercent = votedCount > 0 ? (yesCount / votedCount) * 100 : 0;
-
-    let kopfResultText = '';
-    if (votedCount === 0) {
-      kopfResultText = 'Kopfmehrheit: Keine Stimmen abgegeben';
-    } else if (kopfMajorityReached) {
-      kopfResultText = `Kopfmehrheit: Angenommen — ${yesCount} von ${votedCount} Eigentümern (${kopfYesPercent.toFixed(1)}% Ja)`;
-    } else {
-      kopfResultText = `Kopfmehrheit: Abgelehnt — ${yesCount} von ${votedCount} Eigentümern (${kopfYesPercent.toFixed(1)}% Ja)`;
-    }
-
-    // ─── Invalidierungs-Erkennung ────────────────────────────────────────────────
-    // Wenn ein Umlaufbeschluss von passed=true auf passed=false kippt, muss:
-    //   1. Ein Hinweistext ins Protokoll (invalidationWarning)
-    //   2. Eine E-Mail an alle Verwalter / Admins der Organisation
-    const newPassed = isUmlauf ? majorityReached : (majorityReached && quorumReached);
-
-    let invalidationWarning: string | undefined;
-
-    if (isUmlauf && !newPassed) {
-      // Vorherigen Zustand aus DB lesen (innerhalb der Transaktion — sieht den
-      // gesperrten Zustand vor unserem UPSERT, also das letzte committed Ergebnis).
-      const [prevResult] = await tx
-        .select({ passed: wegVoteResults.passed })
-        .from(wegVoteResults)
-        .where(eq(wegVoteResults.voteId, voteId));
-
-      if (prevResult?.passed === true) {
-        // Flip von true → false: Protokoll-Fälschung erkannt
-        const flipReason = noCount > 0
-          ? `${noCount} nachträgliche(r) Nein-Stimme(n)`
-          : `${abstainCount} nachträgliche(r) Enthaltung(en)`;
-        invalidationWarning =
-          `ACHTUNG: Dieser Umlaufbeschluss war zuvor als angenommen protokolliert und wurde ` +
-          `durch ${flipReason} nachträglich ungültig (§ 24 Abs. 1 WEG 2002). ` +
-          `Bitte das Protokoll berichtigen und alle Beteiligten informieren.`;
-
-        // E-Mail wird nach dem Commit gesendet — nicht innerhalb der Transaktion,
-        // damit SMTP-Latenz den Row-Lock nicht verlängert.
-        const effectiveSendEmail = sendEmailFn ?? (await import("../lib/resend").then(m => m.sendEmail));
-        pendingInvalidationEmail = {
-          organizationId,
-          voteId,
-          voteTopic: vote.topic,
-          invalidationWarning,
-          sendEmailFn: effectiveSendEmail,
-        };
-      }
-    }
-
-    const txResult: VoteResult = {
-      voteId,
-      totalMeaShares,
-      votedMeaShares,
-      quorumReached,
-      quorumPercent,
-      yesShares,
-      noShares,
-      abstainShares,
-      majorityReached,
-      requiredMajority,
-      resultText,
-      totalOwnerCount,
-      yesCount,
-      noCount,
-      abstainCount,
-      kopfMajorityReached,
-      kopfResultText,
-      ...(invalidationWarning ? { invalidationWarning } : {}),
-    };
-
-    // ─── Ergebnis persistieren (UPSERT) ────────────────────────────────────────
-    try {
-      await tx.insert(wegVoteResults).values({
-        voteId,
-        passed: newPassed,
-        quorumReached,
-        yesShares: yesShares.toString() as any,
-        noShares: noShares.toString() as any,
-        abstainShares: abstainShares.toString() as any,
-        yesCount,
-        noCount,
-        abstainCount,
-        resultText,
-        kopfMajorityReached,
-        kopfResultText,
-        ...(invalidationWarning ? { invalidationWarning } : {}),
-      }).onConflictDoUpdate({
-        target: wegVoteResults.voteId,
-        set: {
-          passed: newPassed,
-          quorumReached,
-          yesShares: yesShares.toString() as any,
-          noShares: noShares.toString() as any,
-          abstainShares: abstainShares.toString() as any,
-          yesCount,
-          noCount,
-          abstainCount,
-          resultText,
-          kopfMajorityReached,
-          kopfResultText,
-          calculatedAt: new Date(),
-          // Einmal gesetzt bleibt invalidationWarning erhalten, auch wenn später
-          // alle zu Ja wechseln — es dokumentiert dass eine Invalidierung stattgefunden hat.
-          ...(invalidationWarning ? { invalidationWarning } : {}),
-        },
-      });
-    } catch (err) {
-      // Non-fatal: Log but don't fail the calculation if persistence fails
-      console.error("Warnung: Abstimmungsergebnis konnte nicht gespeichert werden:", err);
-    }
-
-    return txResult;
+    const { result, invalidationData: data } = await _runVoteCalculationAndPersist(tx, voteId, organizationId);
+    invalidationData = data;
+    return result;
   }); // ← Transaktion committed hier; Row-Lock wird freigegeben
 
-  // ─── E-Mail nach Commit ──────────────────────────────────────────────────────
-  // Außerhalb der Transaktion: SMTP-Latenz verlängert den Row-Lock nicht.
-  if (pendingInvalidationEmail) {
-    await notifyManagersOfInvalidation(pendingInvalidationEmail);
+  // ─── E-Mail nach Commit ────────────────────────────────────────────────────────
+  if (invalidationData) {
+    const effectiveSendEmail = sendEmailFn ?? (await import("../lib/resend").then(m => m.sendEmail));
+    await notifyManagersOfInvalidation({ ...invalidationData, sendEmailFn: effectiveSendEmail });
   }
 
   return result;
+}
+
+/**
+ * Atomare Variante: Stimme-INSERT und Ergebnisberechnung in EINER Transaktion.
+ *
+ * Schlägt die Berechnung oder der UPSERT fehl, rollt die gesamte Transaktion
+ * zurück — die Stimme wird NICHT committed. Dies behebt den Konsistenzbruch
+ * aus dem bisherigen Zwei-Schritt-Design (INSERT committed, calculateVoteResult
+ * schlägt fehl → inkonsistenter Zustand).
+ *
+ * @param voteData       Insert-Daten für die neue Eigentümerstimme
+ * @param organizationId Org-ID zur Zugehörigkeitsprüfung
+ * @param sendEmailFn    Optionale E-Mail-Fn (Default: resend.sendEmail)
+ */
+export async function recordOwnerVoteAndCalculate(
+  voteData: InsertWegOwnerVote,
+  organizationId: string,
+  sendEmailFn?: SendEmailFn,
+): Promise<{ createdVote: WegOwnerVote; result: VoteResult }> {
+  let invalidationData: PendingInvalidationData | undefined;
+  let createdVote!: WegOwnerVote;
+
+  const result = await db.transaction(async (tx) => {
+    // ── 1. SELECT FOR UPDATE zuerst — VOR dem INSERT ──────────────────────────
+    // Wichtig: Die FK-Prüfung beim INSERT auf weg_owner_votes.voteId acquiriert
+    // einen RowShareLock auf weg_votes. Würden mehrere gleichzeitige Transaktionen
+    // zuerst alle inserieren (RowShareLock) und dann alle SELECT FOR UPDATE
+    // (ExclusiveLock) versuchen, entsteht ein Lock-Upgrade-Deadlock. Durch das
+    // Voraus-Locken mit FOR UPDATE hält jede Transaktion die ExclusiveLock bevor
+    // die FK-Prüfung läuft — kein zirkuläres Warten möglich.
+    const [earlyVote] = await tx
+      .select({ id: wegVotes.id })
+      .from(wegVotes)
+      .where(eq(wegVotes.id, voteData.voteId!))
+      .for('update');
+    if (!earlyVote) throw new Error("Abstimmung nicht gefunden");
+
+    // ── 2. Stimme speichern (atomar mit Schritt 3) ─────────────────────────────
+    [createdVote] = await tx.insert(wegOwnerVotes).values(voteData).returning() as any;
+
+    // ── 3. Berechnung + UPSERT im selben Tx — Fehler rollen beides zurück ──────
+    // _runVoteCalculationAndPersist macht ebenfalls SELECT FOR UPDATE — in der
+    // gleichen Transaktion ist das idempotent (Lock wird einfach wiederverwendet).
+    const { result: calcResult, invalidationData: data } =
+      await _runVoteCalculationAndPersist(tx, voteData.voteId!, organizationId);
+    invalidationData = data;
+    return calcResult;
+  }); // ← tx committed: beide Operationen wurden atomar abgeschlossen
+
+  // ── 3. E-Mail nach Commit (SMTP-Latenz nicht im Row-Lock) ────────────────────
+  if (invalidationData) {
+    const effectiveSendEmail = sendEmailFn ?? (await import("../lib/resend").then(m => m.sendEmail));
+    await notifyManagersOfInvalidation({ ...invalidationData, sendEmailFn: effectiveSendEmail });
+  }
+
+  return { createdVote, result };
 }

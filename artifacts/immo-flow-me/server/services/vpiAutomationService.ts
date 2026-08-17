@@ -3,6 +3,7 @@ import { tenants, units, properties, vpiAdjustments, rentHistory, vpiValues } fr
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { format, addMonths } from "date-fns";
 import { de } from "date-fns/locale";
+import { sendEmail } from "../lib/resend";
 
 interface VpiData {
   year: number;
@@ -47,6 +48,28 @@ export function meetsSchwellenwert(
   schwellenwert: number = SCHWELLENWERT,
 ): boolean {
   return percentageIncrease >= schwellenwert;
+}
+
+/**
+ * MietWuG / MRG Deckelung und Hälfteregelung (§16 Abs.6 MRG).
+ *
+ * Richtwertmieten  → voller VPI-Anstieg (keine Kappung durch diese Funktion)
+ * Kategoriemieten  → Hälfteregelung: nur 50 % des Anstiegs darf weitergewälzt werden
+ * Freie Mieten     → vertragliche Regelung gilt; wir wenden keinen gesetzlichen Cap an
+ * null / unbekannt → vorsichtshalber kein Cap (Verwalter entscheidet manuell)
+ *
+ * Gibt den effektiv anzuwendenden prozentualen Anstieg zurück.
+ */
+export function applyMietWuGCap(
+  percentageIncrease: number,
+  mietrechtTyp: string | null | undefined,
+): number {
+  if (mietrechtTyp === 'kategorie') {
+    // §16 Abs.6 MRG: Bei Kategoriemieten gilt die Hälfteregelung.
+    return percentageIncrease / 2;
+  }
+  // 'richtwert', 'frei', null → kein gesetzlicher Cap durch diese Funktion.
+  return percentageIncrease;
 }
 
 // Default-VPI-Basis wenn kein Wert im Tenant-Datensatz hinterlegt ist
@@ -108,11 +131,17 @@ export class VpiAutomationService {
         ? Number(row.tenant.vpiSchwellenwert)
         : SCHWELLENWERT;
 
-      const percentageIncrease = (currentVpi.value - baseVpi) / baseVpi;
+      const rawPercentageIncrease = (currentVpi.value - baseVpi) / baseVpi;
 
-      if (percentageIncrease >= tenantSchwellenwert) {
+      // Audit-Befund V1: MietWuG Deckelung / Hälfteregelung anwenden.
+      // Kategoriemieten (§16 Abs.6 MRG) dürfen nur 50 % des VPI-Anstiegs
+      // weitergegeben werden. Der Mietrechttyp kommt vom Objekt (property.mietrechtTyp).
+      const mietrechtTyp = (row.property as any).mietrechtTyp as string | null | undefined;
+      const effectivePercentage = applyMietWuGCap(rawPercentageIncrease, mietrechtTyp);
+
+      if (effectivePercentage >= tenantSchwellenwert) {
         const currentRent = Number(row.tenant.grundmiete) || 0;
-        const newRent = Math.round(currentRent * (1 + percentageIncrease) * 100) / 100;
+        const newRent = Math.round(currentRent * (1 + effectivePercentage) * 100) / 100;
 
         if (!lastAdjustmentDate || lastAdjustmentDate < new Date(currentVpi.year, currentVpi.month - 1, 1)) {
           adjustments.push({
@@ -122,7 +151,7 @@ export class VpiAutomationService {
             unitNumber: row.unit.topNummer || '',
             currentRent,
             newRent,
-            percentageIncrease,
+            percentageIncrease: effectivePercentage,
             baseVpi,
             currentVpi: currentVpi.value,
             effectiveDate: format(addMonths(new Date(), 1), 'yyyy-MM-01'),

@@ -152,6 +152,18 @@ export class OwnerReportingService {
       const totalIncome = rentIncome + operatingCostsIncome;
       const totalExpensesAmount = maintenanceExpenses + operatingExpenses + otherExpenses;
 
+      const netIncome = totalIncome - totalExpensesAmount;
+
+      // Rendite = Nettomietrendite (Net Rental Yield).
+      // Basis: Jahres-Nettoeinkommen / Jahres-Bruttomieteinnahmen.
+      // Wenn Mieteinnahmen 0 (Leerstand), ist die Rendite nicht definierbar → null.
+      // Für eine echte Kapitalrendite (ROI) wäre der Kaufpreis nötig — der ist
+      // aktuell nicht im Schema. Als Proxy verwenden wir die Nettomietrendite,
+      // die zeigt wie viel Nettoertrag pro Euro Mieteinnahme bleibt.
+      const rendite: number | null = rentIncome > 0
+        ? Math.round((netIncome / rentIncome) * 10000) / 100  // in % mit 2 Nachkommastellen
+        : null;
+
       propertyReports.push({
         propertyId: property.id,
         propertyName: property.name || 'Unbenannt',
@@ -169,7 +181,8 @@ export class OwnerReportingService {
           other: otherExpenses,
           total: totalExpensesAmount,
         },
-        netIncome: totalIncome - totalExpensesAmount,
+        netIncome,
+        rendite,
         receivables: {
           total: totalReceivables,
           overdue: overdueReceivables,

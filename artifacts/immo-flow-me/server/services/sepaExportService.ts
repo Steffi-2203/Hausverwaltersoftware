@@ -39,10 +39,34 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** Zeichenvorrat nach EPC-Rulebook (SEPA "Latin character set"). */
 const SEPA_ALLOWED_RE = /[^A-Za-z0-9/\-?:().,'+ ]/g;
 
+/**
+ * ISO 13616 Mod-97-Prüfsumme (IBAN-Prüfziffer).
+ * Gibt true zurück wenn die IBAN rechnerisch gültig ist.
+ * Voraussetzung: iban ist bereits normalisiert (Großbuchstaben, keine Leerzeichen).
+ */
+export function validateIbanChecksum(iban: string): boolean {
+  // Schritt 1: erste 4 Zeichen ans Ende verschieben
+  const rearranged = iban.slice(4) + iban.slice(0, 4);
+  // Schritt 2: Buchstaben → Zahlen (A=10 … Z=35)
+  const numeric = rearranged.replace(/[A-Z]/g, (ch) => String(ch.charCodeAt(0) - 55));
+  // Schritt 3: Modulo 97 über den gesamten numerischen String (kein BigInt nötig: schrittweise)
+  let remainder = 0;
+  for (const char of numeric) {
+    remainder = (remainder * 10 + parseInt(char, 10)) % 97;
+  }
+  return remainder === 1;
+}
+
 export function normalizeIban(value: string, label: string): string {
   const iban = (value || '').replace(/\s/g, '').toUpperCase();
   if (!IBAN_RE.test(iban)) {
-    throw new Error(`${label}: ungültige IBAN (${value || 'leer'})`);
+    throw new Error(`${label}: ungültige IBAN — Format ungültig (${value || 'leer'})`);
+  }
+  // Audit-Befund M1 (Erweiterung): ISO 13616 Mod-97-Prüfziffer validieren.
+  // Ein falsch getippter Buchstabe/eine Ziffer passiert den Regex-Filter,
+  // würde aber von der Empfängerbank abgelehnt.
+  if (!validateIbanChecksum(iban)) {
+    throw new Error(`${label}: ungültige IBAN — Prüfziffer (Mod-97) stimmt nicht (${iban})`);
   }
   return iban;
 }
