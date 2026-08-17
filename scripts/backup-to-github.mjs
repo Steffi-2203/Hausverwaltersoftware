@@ -90,6 +90,9 @@ for (const path of files) {
   // Chat-Anhänge (alte Code-Snapshots/ZIPs, Logs, Screenshots) gehören nicht
   // ins öffentliche Backup — sie können PII/Interna enthalten.
   if (path.startsWith("attached_assets/")) continue;
+  // Workspace-Config nie in ein öffentliches Repo pushen — enthält env vars
+  // und ggf. Replit-interne Konfiguration.
+  if (path === ".replit" || path === "replit.nix") continue;
   let st;
   try {
     st = statSync(path);
