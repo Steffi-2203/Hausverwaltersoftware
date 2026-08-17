@@ -1,0 +1,23 @@
+kind = "web"
+previewPath = "/"
+title = "IMMO FLOW ME"
+description = "Österreichische Hausverwaltungssoftware (MRG/WEG/HeizKG-konform) mit doppelter Buchführung, SEPA-Export, Betriebskostenabrechnung, Mieter- und Eigentümerportalen sowie KI-Assistenten."
+version = "1.0.0"
+id = "artifacts/immo-flow-me"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23964
+
+[services.development]
+run = "pnpm --filter @workspace/immo-flow-me run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/immo-flow-me", "run", "build" ]
+run = "pnpm --filter @workspace/immo-flow-me run start"
+
+[services.env]
+PORT = "23964"
+BASE_PATH = "/"

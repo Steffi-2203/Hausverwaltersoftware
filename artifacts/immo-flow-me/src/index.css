@@ -1,0 +1,311 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* ImmoFlowMe Brand Colors */
+    --brand-primary-50: 210 100% 95%;
+    --brand-primary-100: 210 100% 90%;
+    --brand-primary-500: 210 100% 40%;
+    --brand-primary-600: 210 100% 32%;
+    --brand-primary-700: 210 100% 24%;
+    
+    --brand-secondary-50: 162 100% 95%;
+    --brand-secondary-100: 162 100% 90%;
+    --brand-secondary-500: 162 100% 40%;
+    --brand-secondary-600: 162 100% 32%;
+    --brand-secondary-700: 162 100% 24%;
+
+    /* Professional property management color palette */
+    --background: 0 0% 100%;
+    --foreground: 221 39% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 221 39% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 221 39% 11%;
+
+    /* Primary uses brand blue */
+    --primary: 210 100% 40%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Light blue-gray for secondary elements */
+    --secondary: 210 20% 96%;
+    --secondary-foreground: 221 39% 11%;
+
+    --muted: 210 20% 96%;
+    --muted-foreground: 220 9% 46%;
+
+    /* Accent uses brand secondary (turquoise) */
+    --accent: 162 100% 40%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 27 24.5% 57.7%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Success green for positive values */
+    --success: 142 70% 40%;
+    --success-foreground: 0 0% 100%;
+
+    /* Warning amber for alerts */
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 220 14% 90%;
+    --input: 220 14% 90%;
+    --ring: 210 100% 40%;
+
+    --radius: 0.5rem;
+
+    /* Sidebar - uses brand colors */
+    --sidebar-background: 210 100% 24%;
+    --sidebar-foreground: 0 0% 100%;
+    --sidebar-primary: 162 100% 40%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 210 100% 32%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 210 100% 20%;
+    --sidebar-ring: 162 100% 40%;
+
+    /* Custom semantic tokens */
+    --nav-height: 4rem;
+    --content-max-width: 1400px;
+
+    /* Status colors */
+    --status-active: 142 70% 40%;
+    --status-vacant: 38 92% 50%;
+    --status-ended: 0 0% 60%;
+
+    /* Data table */
+    --table-header: 210 20% 96%;
+    --table-row-hover: 210 25% 97%;
+    --table-border: 214 25% 92%;
+    --chart-1: 210 100% 40%;
+    --chart-2: 162 100% 40%;
+    --chart-3: 220 9% 46%;
+    --chart-4: 210 100% 60%;
+    --chart-5: 162 100% 60%;
+    --sidebar: 210 20% 98%;
+    --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+    --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    --shadow-2xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+    --shadow-xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+    --shadow-sm: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+    --shadow: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+    --shadow-md: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 2px 4px -1px hsl(0 0% 0% / 0.1);
+    --shadow-lg: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 4px 6px -1px hsl(0 0% 0% / 0.1);
+    --shadow-xl: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 8px 10px -1px hsl(0 0% 0% / 0.1);
+    --shadow-2xl: 0 1px 3px 0px hsl(0 0% 0% / 0.25);
+    --tracking-normal: 0em;
+    --spacing: 0.25rem;
+  }
+
+  .dark {
+    /* Brand colors stay consistent in dark mode */
+    --brand-primary-50: 210 100% 95%;
+    --brand-primary-100: 210 100% 90%;
+    --brand-primary-500: 210 100% 50%;
+    --brand-primary-600: 210 100% 40%;
+    --brand-primary-700: 210 100% 32%;
+    
+    --brand-secondary-50: 162 100% 95%;
+    --brand-secondary-100: 162 100% 90%;
+    --brand-secondary-500: 162 100% 50%;
+    --brand-secondary-600: 162 100% 40%;
+    --brand-secondary-700: 162 100% 32%;
+
+    --background: 221 39% 8%;
+    --foreground: 210 20% 98%;
+
+    --card: 221 39% 11%;
+    --card-foreground: 210 20% 98%;
+
+    --popover: 221 39% 11%;
+    --popover-foreground: 210 20% 98%;
+
+    --primary: 210 100% 50%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 221 30% 18%;
+    --secondary-foreground: 210 20% 98%;
+
+    --muted: 221 30% 18%;
+    --muted-foreground: 220 9% 60%;
+
+    --accent: 162 100% 50%;
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 70% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 221 30% 20%;
+    --input: 221 30% 20%;
+    --ring: 210 100% 50%;
+
+    --sidebar-background: 210 100% 18%;
+    --sidebar-foreground: 210 20% 98%;
+    --sidebar-primary: 162 100% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 210 100% 25%;
+    --sidebar-accent-foreground: 210 20% 98%;
+    --sidebar-border: 210 100% 15%;
+    --sidebar-ring: 162 100% 50%;
+
+    --status-active: 142 70% 45%;
+    --status-vacant: 38 92% 55%;
+    --status-ended: 0 0% 50%;
+
+    --table-header: 221 30% 15%;
+    --table-row-hover: 221 30% 14%;
+    --table-border: 221 30% 20%;
+    --chart-1: 210 100% 50%;
+    --chart-2: 162 100% 50%;
+    --chart-3: 220 9% 60%;
+    --chart-4: 210 100% 70%;
+    --chart-5: 162 100% 70%;
+    --sidebar: 221 39% 11%;
+    --radius: 0rem;
+    --shadow-2xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+    --shadow-xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+    --shadow-sm: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+    --shadow: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 1px 2px -1px hsl(0 0% 0% / 0.1);
+    --shadow-md: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 2px 4px -1px hsl(0 0% 0% / 0.1);
+    --shadow-lg: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 4px 6px -1px hsl(0 0% 0% / 0.1);
+    --shadow-xl: 0 1px 3px 0px hsl(0 0% 0% / 0.1), 0 8px 10px -1px hsl(0 0% 0% / 0.1);
+    --shadow-2xl: 0 1px 3px 0px hsl(0 0% 0% / 0.25);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-semibold tracking-tight;
+  }
+}
+
+@layer components {
+  /* Professional data table styling */
+  .data-table {
+    @apply w-full border-collapse;
+  }
+
+  .data-table th {
+    @apply bg-table-header text-left text-sm font-semibold text-muted-foreground px-4 py-3 border-b border-table-border;
+  }
+
+  .data-table td {
+    @apply px-4 py-3 text-sm border-b border-table-border;
+  }
+
+  .data-table tr:hover {
+    @apply bg-table-row-hover;
+  }
+
+  /* Status badges */
+  .status-badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .status-active {
+    @apply bg-success/15 text-success;
+  }
+
+  .status-vacant {
+    @apply bg-warning/15 text-warning;
+  }
+
+  .status-ended {
+    @apply bg-muted text-muted-foreground;
+  }
+
+  /* Card with subtle shadow */
+  .card-elevated {
+    @apply bg-card rounded-lg border border-border shadow-sm;
+  }
+
+  /* Metric cards */
+  .metric-card {
+    @apply card-elevated p-5;
+  }
+
+  .metric-value {
+    @apply text-2xl font-bold text-foreground;
+  }
+
+  .metric-label {
+    @apply text-sm text-muted-foreground mt-1;
+  }
+
+  /* Navigation active state */
+  .nav-item-active {
+    @apply bg-sidebar-accent text-sidebar-accent-foreground;
+  }
+
+  /* Form sections */
+  .form-section {
+    @apply space-y-4 p-6 bg-card rounded-lg border border-border;
+  }
+
+  .form-section-title {
+    @apply text-lg font-semibold text-foreground mb-4 pb-2 border-b border-border;
+  }
+
+  /* Percentage indicators */
+  .percentage-bar {
+    @apply h-2 rounded-full bg-secondary overflow-hidden;
+  }
+
+  .percentage-fill {
+    @apply h-full rounded-full bg-primary transition-all duration-300;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Smooth transitions */
+  .transition-default {
+    @apply transition-all duration-200 ease-in-out;
+  }
+
+  /* Currency formatting helper */
+  .currency::before {
+    content: '€';
+    @apply mr-0.5;
+  }
+
+  /* Scrollbar styling */
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-muted rounded-full;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-border rounded-full hover:bg-muted-foreground/30;
+  }
+}

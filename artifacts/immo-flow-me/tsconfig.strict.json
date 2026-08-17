@@ -1,0 +1,34 @@
+{
+  "//": [
+    "Gestufte Strict-Migration: Dieser Config unterwirft den FINANZKRITISCHEN Kern",
+    "(Geld-Arithmetik, Services, Shared Schema) dem vollen Strict-Mode, ohne die",
+    "gesamte Codebasis auf einmal zu brechen.",
+    "Ausführen mit: npm run typecheck:strict",
+    "Migrationspfad: 1) server/lib + shared fehlerfrei machen, 2) server/services,",
+    "3) server/routes aufnehmen, 4) src/ aufnehmen, 5) strict in tsconfig.app.json",
+    "und tsconfig.json aktivieren und diese Datei löschen."
+  ],
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true
+  },
+  "include": [
+    "server/lib/money.ts",
+    "server/services/heatBillingService.ts",
+    "shared/**/*.ts"
+  ]
+}

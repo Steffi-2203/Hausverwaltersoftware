@@ -1,0 +1,72 @@
+{
+  "organizations": [
+    {
+      "id": "00000000-0000-0000-0000-000000000100",
+      "name": "Test Organisation"
+    }
+  ],
+  "properties": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "organizationId": "00000000-0000-0000-0000-000000000100",
+      "name": "Testhaus Wien",
+      "address": "Testgasse 1",
+      "city": "Wien",
+      "postalCode": "1010"
+    }
+  ],
+  "units": [
+    {
+      "id": "00000000-0000-0000-0000-000000000011",
+      "propertyId": "00000000-0000-0000-0000-000000000001",
+      "topNummer": "Top 1",
+      "type": "wohnung",
+      "flaeche": 65.5
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000012",
+      "propertyId": "00000000-0000-0000-0000-000000000001",
+      "topNummer": "Top 2",
+      "type": "wohnung",
+      "flaeche": 80.0
+    }
+  ],
+  "tenants": [
+    {
+      "id": "00000000-0000-0000-0000-000000000021",
+      "unitId": "00000000-0000-0000-0000-000000000011",
+      "firstName": "Test",
+      "lastName": "Mieter",
+      "grundmiete": 650.00,
+      "betriebskostenVorschuss": 120.00,
+      "heizkostenVorschuss": 80.00,
+      "status": "aktiv"
+    }
+  ],
+  "monthly_invoices": [
+    {
+      "id": "00000000-0000-0000-0000-000000000031",
+      "tenantId": "00000000-0000-0000-0000-000000000021",
+      "unitId": "00000000-0000-0000-0000-000000000011",
+      "year": 2026,
+      "month": 1,
+      "grundmiete": 650.00,
+      "betriebskosten": 120.00,
+      "heizungskosten": 80.00,
+      "gesamtbetrag": 850.00,
+      "status": "offen"
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000032",
+      "tenantId": "00000000-0000-0000-0000-000000000021",
+      "unitId": "00000000-0000-0000-0000-000000000011",
+      "year": 2026,
+      "month": 2,
+      "grundmiete": 650.00,
+      "betriebskosten": 120.00,
+      "heizungskosten": 80.00,
+      "gesamtbetrag": 850.00,
+      "status": "offen"
+    }
+  ]
+}

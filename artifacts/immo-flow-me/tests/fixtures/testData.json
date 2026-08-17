@@ -1,0 +1,13 @@
+{
+  "properties": [
+    { "id": "prop-1", "organizationId": null, "name": "Test Objekt", "address": "Hauptstr 1", "city": "Waidhofen", "postalCode": "3340", "createdAt": "2026-01-01T00:00:00Z" }
+  ],
+  "units": [
+    { "id": "u1", "propertyId": "prop-1", "topNummer": "1A", "type": "wohnung", "flaeche": "50.00", "createdAt": "2026-01-01T00:00:00Z" },
+    { "id": "u2", "propertyId": "prop-1", "topNummer": "1B", "type": "wohnung", "flaeche": "60.00", "createdAt": "2026-01-01T00:00:00Z" }
+  ],
+  "tenants": [
+    { "id": "t1", "unitId": "u1", "firstName": "Max", "lastName": "Mustermann", "grundmiete": "100.00", "betriebskostenVorschuss": "20.00", "heizkostenVorschuss": "10.00", "status": "aktiv", "createdAt": "2026-01-01T00:00:00Z" },
+    { "id": "t2", "unitId": "u2", "firstName": "Anna", "lastName": "Muster", "grundmiete": "200.00", "betriebskostenVorschuss": "30.00", "heizkostenVorschuss": "15.00", "status": "aktiv", "createdAt": "2026-01-01T00:00:00Z" }
+  ]
+}

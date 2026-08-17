@@ -1,0 +1,67 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.env
+
+# Debug temp files (kurzlebig, nicht versioniert)
+tmp/
+upsert_errors.json
+*.dump
+
+# Reconciliation debug outputs (Root-Level, kurzlebig)
+dryrun.json
+db_lines.json
+invoice_lines_run.json
+generate.json
+missing_lines.json
+missing_lines.csv
+
+# reconciliations/ wird BEWUSST versioniert (auditierbare Ergebnisse)
+# → reconciliations/<runId>/missing_lines.csv + summary.json
+
+# ===== Nie versionieren: Datenbank-Dumps & Backups (PII-Risiko!) =====
+*.sql
+!drizzle/**/*.sql
+!migrations/**/*.sql
+!supabase/**/*.sql
+*.dump
+backup_*
+pre_reconcile_*
+
+# ===== Laufzeit-/generierte Daten =====
+data/
+reconciliations/
+uploads/
+
+# ===== Test- & Build-Artefakte =====
+playwright-report/
+test-results/
+coverage/
+vite.config.ts.timestamp-*.mjs
+
+# ===== KI-Entwicklungsartefakte =====
+attached_assets/
+
+# ===== Lockfile-Konflikt vermeiden (npm ist maßgeblich) =====
+bun.lock

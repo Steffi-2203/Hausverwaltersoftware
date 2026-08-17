@@ -1,0 +1,14 @@
+{
+  "name": "vitest",
+  "version": "1.0.0-shim",
+  "description": "Local vitest shim using node:test (Replit firewall blocks real vitest package)",
+  "type": "module",
+  "main": "./index.mjs",
+  "bin": {
+    "vitest": "./bin.mjs"
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./config": "./config.mjs"
+  }
+}

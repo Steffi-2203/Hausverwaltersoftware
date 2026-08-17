@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/immo-ocr-mobile/"
+title = "IMMO OCR Scanner"
+description = "Mobile Companion-App für IMMO FLOW ME. Verwalter können Rechnungen direkt vor Ort mit der Handykamera scannen. Die App schickt das Bild an die OCR-API, zeigt das Ergebnis mit Confidence-Badge an und öffnet bei niedrigem Score automatisch ein Review-Formular. Korrekturen werden ins Audit-Log geschrieben."
+version = "1.0.0"
+id = "artifacts/immo-ocr-mobile"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/immo-ocr-mobile/" ]
+localPort = 21031
+
+[services.development]
+run = "pnpm --filter @workspace/immo-ocr-mobile run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/immo-ocr-mobile", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/immo-ocr-mobile", "run", "serve" ]
+
+[services.env]
+PORT = "21031"
+BASE_PATH = "/immo-ocr-mobile/"

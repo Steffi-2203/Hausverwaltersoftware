@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "IMMO OCR Scanner",
+    "slug": "immo-ocr-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "immo-ocr-mobile",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A1628"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Diese App benötigt Kamerazugriff, um Rechnungen direkt zu scannen.",
+        "NSPhotoLibraryUsageDescription": "Diese App benötigt Zugriff auf Ihre Fotobibliothek, um Rechnungsfotos auszuwählen."
+      }
+    },
+    "android": {
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "origin": "https://replit.com/"
+        }
+      ],
+      "expo-font",
+      "expo-web-browser",
+      [
+        "expo-image-picker",
+        {
+          "cameraPermission": "Diese App benötigt Kamerazugriff, um Rechnungen direkt zu scannen.",
+          "microphonePermission": false,
+          "photosPermission": "Diese App benötigt Zugriff auf Ihre Fotobibliothek, um Rechnungsfotos auszuwählen."
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    }
+  }
+}
