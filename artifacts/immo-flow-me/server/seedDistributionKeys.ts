@@ -78,32 +78,28 @@ const STANDARD_DISTRIBUTION_KEYS = [
  * Ein einziges INSERT..SELECT legt genau die (Org, key_code)-Paare an, die fehlen.
  */
 export async function seedDistributionKeys(): Promise<void> {
-  try {
-    let created = 0;
-    for (const key of STANDARD_DISTRIBUTION_KEYS) {
-      const result = await db.execute(sql`
-        INSERT INTO distribution_keys
-          (organization_id, key_code, name, description, unit, input_type,
-           is_system, is_active, mrg_konform, mrg_paragraph, sort_order)
-        SELECT o.id, ${key.keyCode}, ${key.name}, ${key.description}, ${key.unit},
-               ${key.inputType}, ${key.isSystem}, true, ${key.mrgKonform},
-               ${key.mrgParagraph}, ${key.sortOrder}
-        FROM organizations o
-        WHERE NOT EXISTS (
-          SELECT 1 FROM distribution_keys dk
-          WHERE dk.organization_id = o.id AND dk.key_code = ${key.keyCode}
-        )
-        ON CONFLICT (organization_id, key_code) WHERE property_id IS NULL DO NOTHING
-      `);
-      created += result.rowCount ?? 0;
-    }
-    if (created > 0) {
-      console.log(`Distribution keys seeded: ${created} rows created across organizations`);
-    } else {
-      console.log("Standard distribution keys already exist, skipping seed");
-    }
-  } catch (error) {
-    console.error("Error seeding distribution keys:", error);
+  let created = 0;
+  for (const key of STANDARD_DISTRIBUTION_KEYS) {
+    const result = await db.execute(sql`
+      INSERT INTO distribution_keys
+        (organization_id, key_code, name, description, unit, input_type,
+         is_system, is_active, mrg_konform, mrg_paragraph, sort_order)
+      SELECT o.id, ${key.keyCode}, ${key.name}, ${key.description}, ${key.unit},
+             ${key.inputType}, ${key.isSystem}, true, ${key.mrgKonform},
+             ${key.mrgParagraph}, ${key.sortOrder}
+      FROM organizations o
+      WHERE NOT EXISTS (
+        SELECT 1 FROM distribution_keys dk
+        WHERE dk.organization_id = o.id AND dk.key_code = ${key.keyCode}
+      )
+      ON CONFLICT (organization_id, key_code) WHERE property_id IS NULL DO NOTHING
+    `);
+    created += result.rowCount ?? 0;
+  }
+  if (created > 0) {
+    console.log(`Distribution keys seeded: ${created} rows created across organizations`);
+  } else {
+    console.log("Standard distribution keys already exist, skipping seed");
   }
 }
 
