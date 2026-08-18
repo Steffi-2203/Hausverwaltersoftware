@@ -186,44 +186,20 @@ describe("Task #83: Warnung 'kein Verteilungsschlüssel' verschwindet nach PATCH
     assert.equal(Number(c2.owner_share), 900);
   });
 
-  test("4) gemischte Zeilen (explizit + NULL) derselben Kategorie → Hinweis-Warnung, expliziter Key bleibt angewendet", async () => {
-    const extraLine = randomUUID();
-    await db.execute(sql`
-      INSERT INTO weg_budget_lines (id, budget_plan_id, category, amount, allocation_key)
-      VALUES (${extraLine}::uuid, ${planId}::uuid, ${CATEGORY}, '100.00', NULL)`);
-    try {
-      const body = await fetchPreview();
-      const warnings = allWarnings(body);
-      // Nicht die "kein Schlüssel"-Warnung (ein expliziter Key existiert ja) …
-      assert.ok(!warnings.some((w) => w.includes(WARN_FRAGMENT) && w.includes(CATEGORY)));
-      // … aber die Unvollständigkeits-Warnung muss erscheinen
-      assert.ok(
-        warnings.some((w) => w.includes("ohne expliziten Verteilungsschlüssel") && w.includes(CATEGORY)),
-        `Hinweis-Warnung fehlt. Warnings: ${JSON.stringify(warnings)}`
-      );
-      // Der explizite Schlüssel bleibt angewendet
-      assert.equal(categoryFor(body, owner1).allocation_key, "Nutzfläche");
-    } finally {
-      await db.execute(sql`DELETE FROM weg_budget_lines WHERE id = ${extraLine}::uuid`);
-    }
-  });
+  // Tests 4 & 5 sind seit Task #169 nicht mehr ausführbar:
+  // Der Unique-Index weg_budget_lines_plan_category_unique (budget_plan_id, lower(category))
+  // verhindert, dass zwei Zeilen mit gleicher Kategorie im selben Plan entstehen.
+  // Die Warnpfade "gemischte Zeilen" und "widersprüchliche Schlüssel" sind damit
+  // totes Holz für Neudaten; Bestandsduplikate wurden durch die Migration konsolidiert.
+  test("4) gemischte Zeilen (explizit + NULL) derselben Kategorie → Hinweis-Warnung, expliziter Key bleibt angewendet",
+    { skip: "Unique-Constraint (Task #169) verhindert doppelte Kategorien — dieser Warnpfad tritt bei Neudaten nicht mehr auf" },
+    async () => { /* nicht erreichbar */ }
+  );
 
-  test("5) widersprüchliche explizite Schlüssel derselben Kategorie → Konflikt-Warnung", async () => {
-    const extraLine = randomUUID();
-    await db.execute(sql`
-      INSERT INTO weg_budget_lines (id, budget_plan_id, category, amount, allocation_key)
-      VALUES (${extraLine}::uuid, ${planId}::uuid, ${CATEGORY}, '100.00', 'einheiten')`);
-    try {
-      const body = await fetchPreview();
-      const warnings = allWarnings(body);
-      assert.ok(
-        warnings.some((w) => w.includes("widersprüchliche Verteilungsschlüssel") && w.includes(CATEGORY)),
-        `Konflikt-Warnung fehlt. Warnings: ${JSON.stringify(warnings)}`
-      );
-    } finally {
-      await db.execute(sql`DELETE FROM weg_budget_lines WHERE id = ${extraLine}::uuid`);
-    }
-  });
+  test("5) widersprüchliche explizite Schlüssel derselben Kategorie → Konflikt-Warnung",
+    { skip: "Unique-Constraint (Task #169) verhindert doppelte Kategorien — dieser Warnpfad tritt bei Neudaten nicht mehr auf" },
+    async () => { /* nicht erreichbar */ }
+  );
 
   test("6) explizit gespeichertes 'mea' gilt als konfiguriert → keine Warnung", async () => {
     const meaLine = randomUUID();

@@ -1797,6 +1797,11 @@ export const jobQueue = pgTable("job_queue", {
   createdBy: uuid("created_by"),
   startedAt: timestamp("started_at", { withTimezone: true }),
   completedAt: timestamp("completed_at", { withTimezone: true }),
+  /** Wird gesetzt nachdem der Handler erfolgreich beendet wurde — BEVOR status='completed'.
+   *  Dient als fälschungssicherer Abschluss-Marker (task #182): da job_queue nie über
+   *  HTTP beschreibbar ist, kann kein Client dieses Feld vorbelegen.
+   *  Ermöglicht processNext() bei einem erneuten Lauf den Handler zu überspringen. */
+  handlerCompletedAt: timestamp("handler_completed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
   index("idx_job_queue_status").on(table.status),

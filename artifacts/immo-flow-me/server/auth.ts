@@ -235,47 +235,70 @@ export async function isPrivileged2FACompliant(userId: string): Promise<boolean>
   return !!rec[0];
 }
 
-export function enforcePrivileged2FA(req: Request, res: Response, next: NextFunction) {
-  (async () => {
-    const path = req.path;
-    if (!path.startsWith("/api/")) return next();
-    if (TWO_FA_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return next();
+/**
+ * Factory für enforcePrivileged2FA — ermöglicht Dependency Injection des
+ * Token-Resolvers in Tests, ohne globalen Zustand zu mutieren.
+ * Produktionscode verwendet enforcePrivileged2FA (Default-Export unterhalb).
+ */
+export function createEnforcePrivileged2FA(
+  tokenResolver: (req: Request) => Promise<boolean> = resolveTokenAuth,
+): (req: Request, res: Response, next: NextFunction) => void {
+  return function enforcePrivileged2FA(req, res, next) {
+    (async () => {
+      const path = req.path;
+      if (!path.startsWith("/api/")) return next();
+      if (TWO_FA_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return next();
 
-    const s = req.session as any;
-    if (!s?.userId) {
-      // Bearer-Token-Clients (Mobile) hier auflösen, damit auch sie geprüft
-      // werden — sonst wäre der Token-Pfad ein 2FA-Bypass.
-      const ok = await resolveTokenAuth(req);
-      if (!ok) return next(); // unauthentifiziert → Route-Guards liefern 401
-    }
+      const s = req.session as any;
+      if (!s?.userId) {
+        // Bearer-Token-Clients (Mobile) hier auflösen, damit auch sie geprüft
+        // werden — sonst wäre der Token-Pfad ein 2FA-Bypass.
+        const ok = await tokenResolver(req);
+        if (!ok) return next(); // unauthentifiziert → Route-Guards liefern 401
+      }
 
-    // Session-Cache mit kurzer TTL: begrenzt DB-Last, ohne Rollen-/2FA-Änderungen
-    // dauerhaft zu ignorieren (nachträgliche Admin-Rolle oder 2FA-Deaktivierung
-    // in einer anderen Session greift spätestens nach Ablauf der TTL).
-    // Bei /api/2fa/disable wird der Cache zusätzlich sofort gelöscht.
-    if (
-      s.twoFactorEnforcedFor === s.userId &&
-      typeof s.twoFactorEnforcedAt === "number" &&
-      Date.now() - s.twoFactorEnforcedAt < TWO_FA_CACHE_TTL_MS
-    ) {
+      // Session-Cache mit kurzer TTL: begrenzt DB-Last, ohne Rollen-/2FA-Änderungen
+      // dauerhaft zu ignorieren (nachträgliche Admin-Rolle oder 2FA-Deaktivierung
+      // in einer anderen Session greift spätestens nach Ablauf der TTL).
+      // Bei /api/2fa/disable wird der Cache zusätzlich sofort gelöscht.
+      if (
+        s.twoFactorEnforcedFor === s.userId &&
+        typeof s.twoFactorEnforcedAt === "number" &&
+        Date.now() - s.twoFactorEnforcedAt < TWO_FA_CACHE_TTL_MS
+      ) {
+        return next();
+      }
+
+      const compliant = await isPrivileged2FACompliant(s.userId);
+      if (!compliant) {
+        delete s.twoFactorEnforcedFor;
+        delete s.twoFactorEnforcedAt;
+        return res.status(403).json({
+          error: "Zwei-Faktor-Authentifizierung muss eingerichtet werden",
+          code: "2FA_SETUP_REQUIRED",
+          redirectTo: "/2fa-einrichten",
+        });
+      }
+      s.twoFactorEnforcedFor = s.userId;
+      s.twoFactorEnforcedAt = Date.now();
       return next();
-    }
-
-    const compliant = await isPrivileged2FACompliant(s.userId);
-    if (!compliant) {
-      delete s.twoFactorEnforcedFor;
-      delete s.twoFactorEnforcedAt;
-      return res.status(403).json({
-        error: "Zwei-Faktor-Authentifizierung muss eingerichtet werden",
-        code: "2FA_SETUP_REQUIRED",
-        redirectTo: "/2fa-einrichten",
-      });
-    }
-    s.twoFactorEnforcedFor = s.userId;
-    s.twoFactorEnforcedAt = Date.now();
-    return next();
-  })().catch(next); // Fehler → zentraler Error-Handler (fail-closed, kein Durchlass)
+    })().catch((err: unknown) => {
+      // DB-Fehler beim Token-Lookup → 503 retryable (konsistent mit isAuthenticated).
+      // Unerwartete Fehler → zentraler Error-Handler (fail-closed, kein Durchlass).
+      if (err instanceof TokenLookupDbError) {
+        return res.status(503).json({
+          message: "Dienst vorübergehend nicht verfügbar — bitte kurz warten und erneut versuchen",
+          retryable: true,
+          code: "TOKEN_DB_ERROR",
+        });
+      }
+      return next(err);
+    });
+  };
 }
+
+/** Produktions-Middleware (verwendet echten Token-Resolver). */
+export const enforcePrivileged2FA = createEnforcePrivileged2FA();
 
 export function isAuthenticated(req: Request, res: Response, next: NextFunction) {
   if (req.session?.userId) {

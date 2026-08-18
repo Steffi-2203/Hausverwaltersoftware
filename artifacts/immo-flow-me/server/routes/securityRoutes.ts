@@ -1,5 +1,5 @@
 import type { Express, Request, Response, NextFunction } from "express";
-import { db } from "../db";
+import { db, rootDb } from "../db";
 import { eq, and, desc, sql, count, ne } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { storage } from "../storage";
@@ -213,6 +213,32 @@ export function registerSecurityRoutes(app: Express) {
     } catch (error) {
       console.error("Security sessions bulk delete error:", error);
       res.status(500).json({ error: "Fehler beim Beenden der Sitzungen" });
+    }
+  });
+
+  // ── Manipulationsversuche (IMMUTABLE_VIOLATION) ────────────────────────────
+  // audit_logs ist global (kein Org-Scope), daher rootDb — kein withOrgContext nötig.
+  app.get("/api/security/violations", async (req: Request, res: Response) => {
+    try {
+      const ctx = await getAuthContext(req, res, true);
+      if (!ctx) return;
+
+      const violations = await rootDb
+        .select({
+          id:        schema.auditLogs.id,
+          tableName: schema.auditLogs.tableName,
+          createdAt: schema.auditLogs.createdAt,
+          details:   schema.auditLogs.details,
+        })
+        .from(schema.auditLogs)
+        .where(eq(schema.auditLogs.action, "IMMUTABLE_VIOLATION"))
+        .orderBy(desc(schema.auditLogs.createdAt))
+        .limit(20);
+
+      res.json(violations);
+    } catch (error) {
+      console.error("Security violations error:", error);
+      res.status(500).json({ error: "Fehler beim Laden der Verletzungsereignisse" });
     }
   });
 

@@ -32,6 +32,7 @@ import {
 } from '@/components/ui/select';
 import {
   Shield,
+  ShieldAlert,
   Monitor,
   Smartphone,
   Tablet,
@@ -49,6 +50,18 @@ import { apiRequest, queryClient } from '@/lib/queryClient';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
 import { de } from 'date-fns/locale';
+
+interface ViolationEntry {
+  id: string;
+  tableName: string;
+  createdAt: string;
+  details: {
+    errorMessage?: string;
+    query?: string | null;
+    organizationId?: string | null;
+    source?: string;
+  } | null;
+}
 
 interface DashboardData {
   activeSessions: number;
@@ -175,6 +188,7 @@ export default function SecurityDashboard() {
   const [sessionToTerminate, setSessionToTerminate] = useState<string | null>(null);
   const [showBulkTerminate, setShowBulkTerminate] = useState(false);
   const [eventFilter, setEventFilter] = useState<string>('all');
+  const [activeTab, setActiveTab] = useState('overview');
 
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['/api/security/dashboard'],
@@ -182,6 +196,10 @@ export default function SecurityDashboard() {
 
   const { data: sessions, isLoading: sessionsLoading } = useQuery<Session[]>({
     queryKey: ['/api/security/sessions'],
+  });
+
+  const { data: violations } = useQuery<ViolationEntry[]>({
+    queryKey: ['/api/security/violations'],
   });
 
   const terminateSession = useMutation({
@@ -241,11 +259,19 @@ export default function SecurityDashboard() {
   return (
     <MainLayout title="Sicherheit" subtitle="Sicherheitseinstellungen und Sitzungsverwaltung">
       <div className="max-w-6xl mx-auto">
-        <Tabs defaultValue="overview" className="w-full">
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
           <TabsList className="mb-6 flex-wrap" data-testid="security-tabs">
             <TabsTrigger value="overview" data-testid="tab-overview">Uebersicht</TabsTrigger>
             <TabsTrigger value="sessions" data-testid="tab-sessions">Aktive Sitzungen</TabsTrigger>
             <TabsTrigger value="events" data-testid="tab-events">Sicherheitsereignisse</TabsTrigger>
+            <TabsTrigger value="violations" data-testid="tab-violations" className="relative">
+              Manipulationsversuche
+              {violations && violations.length > 0 && (
+                <span className="ml-2 inline-flex items-center justify-center rounded-full bg-red-600 text-white text-xs w-5 h-5 font-bold" data-testid="badge-violations-count">
+                  {violations.length}
+                </span>
+              )}
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="overview" className="space-y-6">
@@ -363,6 +389,35 @@ export default function SecurityDashboard() {
                 </div>
               </CardContent>
             </Card>
+
+            {/* Warn-Banner wenn Manipulationsversuche vorhanden */}
+            {violations && violations.length > 0 && (
+              <Card
+                className="border-red-300 bg-red-50 dark:bg-red-950 dark:border-red-800"
+                data-testid="card-violations-alert"
+              >
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2 text-red-700 dark:text-red-400">
+                    <ShieldAlert className="h-5 w-5" />
+                    Manipulationsversuche erkannt
+                  </CardTitle>
+                  <CardDescription className="text-red-600 dark:text-red-300">
+                    {violations.length} Versuch{violations.length !== 1 ? 'e' : ''}, Buchungsdaten zu verändern,
+                    {' '}wurden protokolliert und der Administration gemeldet.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Button
+                    variant="destructive"
+                    onClick={() => setActiveTab('violations')}
+                    data-testid="button-show-violations"
+                  >
+                    <ShieldAlert className="h-4 w-4 mr-2" />
+                    Details anzeigen
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
           </TabsContent>
 
           <TabsContent value="sessions" className="space-y-6">
@@ -513,6 +568,62 @@ export default function SecurityDashboard() {
                 </div>
               </CardContent>
             </Card>
+          </TabsContent>
+
+          {/* ── Manipulationsversuche ────────────────────────────────────── */}
+          <TabsContent value="violations" className="space-y-6">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h2 className="text-lg font-semibold flex items-center gap-2">
+                <ShieldAlert className="h-5 w-5 text-red-600" />
+                Manipulationsversuche an Buchungsdaten
+              </h2>
+            </div>
+
+            {!violations || violations.length === 0 ? (
+              <Card data-testid="card-no-violations">
+                <CardContent className="py-8 text-center text-muted-foreground">
+                  <CheckCircle className="h-8 w-8 mx-auto mb-3 text-green-500" />
+                  Keine Manipulationsversuche erkannt
+                </CardContent>
+              </Card>
+            ) : (
+              <Card data-testid="card-violations-list">
+                <CardContent className="p-0">
+                  <div className="overflow-x-auto">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Zeitpunkt</TableHead>
+                          <TableHead>Tabelle</TableHead>
+                          <TableHead>Fehlermeldung</TableHead>
+                          <TableHead>SQL-Ausschnitt</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {violations.map((v) => (
+                          <TableRow key={v.id} data-testid={`row-violation-${v.id}`} className="bg-red-50/40 dark:bg-red-950/20">
+                            <TableCell className="whitespace-nowrap text-sm">
+                              {format(new Date(v.createdAt), 'dd.MM.yyyy HH:mm:ss', { locale: de })}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="destructive" data-testid={`badge-violation-table-${v.id}`}>
+                                {v.tableName}
+                              </Badge>
+                            </TableCell>
+                            <TableCell className="text-sm text-muted-foreground max-w-xs truncate">
+                              {v.details?.errorMessage ?? '-'}
+                            </TableCell>
+                            <TableCell className="font-mono text-xs text-muted-foreground max-w-sm truncate">
+                              {v.details?.query ? v.details.query.slice(0, 120) : '-'}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
           </TabsContent>
         </Tabs>
       </div>

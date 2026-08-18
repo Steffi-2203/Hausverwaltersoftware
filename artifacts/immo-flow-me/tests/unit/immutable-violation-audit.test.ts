@@ -9,7 +9,7 @@
 import { describe, it, before, after } from 'node:test';
 import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 import assert from 'node:assert/strict';
-import { rootDb as db, appDb, appPool, withOrgContext, activeDb } from '../../server/db';
+import { rootDb as db, appDb, appPool, withOrgContext, activeDb, hasImmutableViolationHandler } from '../../server/db';
 import {
   flushImmutableViolationAudits,
   parseViolatedTable,
@@ -42,6 +42,21 @@ async function violationEntries(tableName: string) {
 // Interferenzen mit anderen Testdateien, die gleichzeitig Audit-Einträge schreiben.
 before(async () => { await acquireAuditLogTestLock(); });
 after(async () => { await releaseAuditLogTestLock(); });
+
+describe('Handler-Registrierung via db.ts (Skript-Kontext-Nachweis)', () => {
+  it('hasImmutableViolationHandler() ist true ohne expliziten server/index.ts-Import', () => {
+    // Nach dem Fix registriert server/db.ts den Handler selbst (Bottom-of-file-
+    // Import von immutableViolationAudit.ts). Dieser Test importiert server/db.ts
+    // direkt (siehe Import oben) — NICHT server/index.ts. Wenn dieser Test
+    // besteht, ist bewiesen, dass Skripte, die nur db.ts verwenden, ebenfalls
+    // vollständig geschützt sind.
+    assert.equal(
+      hasImmutableViolationHandler(),
+      true,
+      'P0001-Audit-Handler muss über db.ts registriert sein, ohne dass index.ts importiert wird',
+    );
+  });
+});
 
 describe('Immutability-Trigger-Verletzungen im Audit-Log', () => {
   before(async () => {

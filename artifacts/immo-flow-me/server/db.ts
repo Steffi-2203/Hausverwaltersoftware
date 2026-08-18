@@ -2,6 +2,17 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { AsyncLocalStorage } from "node:async_hooks";
 import pg from "pg";
 import * as schema from "@shared/schema";
+import {
+  fireImmutableViolation,
+  setImmutableViolationHandler,
+  hasImmutableViolationHandler,
+  type ImmutableViolationEvent,
+} from "./lib/immutableViolationRegistry";
+// Garantierte Handler-Registrierung für ALLE Prozesse die db.ts verwenden
+// (HTTP-Server, Skripte, CLI-Tools). Muss NACH dem Registry-Import stehen.
+// ESM-Zyklus ist sicher: audit.ts holt setImmutableViolationHandler aus der
+// zyklenfreien Registry; currentOrgId ist eine function-Deklaration (hoistbar).
+import "./lib/immutableViolationAudit";
 
 const { Pool } = pg;
 
@@ -17,30 +28,17 @@ if (!process.env.DATABASE_URL) {
  *
  * Verbindet als `postgres` (rolsuper=true, rolbypassrls=true) und DARF NICHT
  * für normale Request-Handler verwendet werden, da er RLS vollständig umgeht.
- */
-/**
- * Immutability-Trigger-Verletzungen (P0001, "… unveränderlich …") werden auf
- * Pool-Ebene abgefangen und an einen registrierten Handler gemeldet, der einen
- * Audit-Log-Eintrag schreibt (siehe server/lib/immutableViolationAudit.ts).
  *
- * Warum hier und nicht im Trigger selbst: ein RAISE EXCEPTION rollt die
- * gesamte Transaktion zurück — ein im Trigger geschriebener audit_logs-Eintrag
- * würde mit zurückgerollt und wäre verloren. Der Handler schreibt daher auf
- * einer separaten Verbindung, NACHDEM die blockierte Query fehlgeschlagen ist.
+ * Immutability-Trigger-Verletzungen (P0001, "… unveränderlich …") werden auf
+ * Pool-Ebene abgefangen und an den über die Registry registrierten Handler
+ * weitergeleitet (siehe server/lib/immutableViolationAudit.ts).
  */
-export interface ImmutableViolationEvent {
-  message: string;
-  queryText?: string;
-}
 
-let immutableViolationHandler: ((e: ImmutableViolationEvent) => void) | null = null;
-
-/** Registriert den (einen) Handler für Immutability-Trigger-Verletzungen. */
-export function setImmutableViolationHandler(
-  fn: (e: ImmutableViolationEvent) => void,
-): void {
-  immutableViolationHandler = fn;
-}
+// Re-Exporte für Abwärtskompatibilität mit Code der diese Symbole aus db.ts
+// importiert. Die eigentlichen Implementierungen leben jetzt in der zyklenfreien
+// immutableViolationRegistry.ts.
+export type { ImmutableViolationEvent } from "./lib/immutableViolationRegistry";
+export { setImmutableViolationHandler, hasImmutableViolationHandler } from "./lib/immutableViolationRegistry";
 
 function notifyImmutableViolation(err: unknown, args: unknown[]): void {
   try {
@@ -48,7 +46,7 @@ function notifyImmutableViolation(err: unknown, args: unknown[]): void {
     if (e?.code !== "P0001" || !/unveränderlich/.test(String(e?.message ?? ""))) return;
     const first = args[0] as string | { text?: string } | undefined;
     const q = typeof first === "string" ? first : first?.text;
-    immutableViolationHandler?.({
+    fireImmutableViolation({
       message: String(e.message),
       queryText: typeof q === "string" ? q.slice(0, 500) : undefined,
     });
@@ -285,3 +283,25 @@ export const db: Db = new Proxy(rootDb as any, {
     return Reflect.has(activeDb() as any, prop); // wirft wenn kein orgContext
   },
 }) as Db;
+
+// ── Garantierte Handler-Registrierung ────────────────────────────────────────
+//
+// Dieser Import MUSS am Ende der Datei stehen — nach allen export-Anweisungen.
+//
+// Warum am Ende (CJS-Zirkularität):
+//   immutableViolationAudit.ts importiert seinerseits aus dieser Datei
+//   (setImmutableViolationHandler, currentOrgId). In CommonJS gibt Node.js
+//   beim Zirkular-Import das bereits vorhandene exports-Objekt zurück.
+//   Da alle export const … hier oben abgearbeitet sind, bevor diese Zeile
+//   ausgeführt wird, sieht immutableViolationAudit.ts ein vollständig
+//   befülltes exports-Objekt — kein undefined, kein Initialisierungsfehler.
+//
+// Warum hier und nicht nur in server/index.ts:
+//   Skripte (server/scripts/*), CLI-Tools und Testhelper importieren direkt
+//   aus server/db.ts, ohne den HTTP-Server zu starten. Der Handler muss in
+//   ALLEN Prozessen registriert sein, die die DB-Pools verwenden — sonst
+//   werden Trigger-Verletzungen in Hintergrundjobs lautlos verschluckt.
+//
+// server/index.ts enthält einen eigenen import für denselben Pfad; da Node.js
+// Module cached, ist der zweite require ein No-Op — keine Doppel-Registrierung.
+import "./lib/immutableViolationAudit";

@@ -175,6 +175,20 @@ router.patch("/api/payments/:id", isAuthenticated, requireRole('property_manager
     if (!validationResult.success) {
       return res.status(400).json({ error: "Validation failed", details: validationResult.error.flatten() });
     }
+    // Unveränderliche Kernfelder (DB-Trigger trg_payments_core_immutable):
+    // betrag und buchungsDatum sind nach dem Anlegen nicht mehr änderbar.
+    // Vorab-Prüfung liefert 422 mit Storno-Hinweis statt eines generischen 500.
+    const IMMUTABLE_FIELDS = ['betrag', 'buchungsDatum'] as const;
+    const attemptedImmutable = IMMUTABLE_FIELDS.filter(
+      (f) => validationResult.data[f] !== undefined,
+    );
+    if (attemptedImmutable.length > 0) {
+      return res.status(422).json({
+        error: "Betrag und Buchungsdatum können nach dem Anlegen nicht mehr geändert werden. Bitte eine Gegenbuchung (Storno) erfassen.",
+        code: "PAYMENT_IMMUTABLE_FIELD",
+        fields: attemptedImmutable,
+      });
+    }
     // Cross-Org-Schutz für invoice_id auch beim Update (siehe POST):
     // die Rechnung muss zum (ggf. unveränderten) Mieter der Zahlung gehören.
     if (validationResult.data.invoiceId) {
@@ -186,18 +200,30 @@ router.patch("/api/payments/:id", isAuthenticated, requireRole('property_manager
     }
     const payment = await storage.updatePayment(req.params.id, validationResult.data);
     res.json(payment);
-  } catch (error) {
+  } catch (error: any) {
+    // Fallback: DB-Trigger P0001 ("unveränderlich") — greift wenn ein Feld
+    // über einen anderen Pfad (z.B. Drizzle-Typen-Coercion) doch die DB erreicht.
+    const msg: string = error?.message ?? error?.cause?.message ?? '';
+    const code: string = error?.code ?? error?.cause?.code ?? '';
+    if (code === 'P0001' && msg.includes('unveränderlich')) {
+      return res.status(422).json({
+        error: "Betrag und Buchungsdatum können nach dem Anlegen nicht mehr geändert werden. Bitte eine Gegenbuchung (Storno) erfassen.",
+        code: "PAYMENT_IMMUTABLE_FIELD",
+      });
+    }
     res.status(500).json({ error: "Failed to update payment" });
   }
 });
 
-router.delete("/api/payments/:id", isAuthenticated, requireRole('property_manager', 'finance'), async (req, res) => {
-  try {
-    await storage.deletePayment(req.params.id);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to delete payment" });
-  }
+// Payments sind unveränderliche Buchungssätze — Löschen ist nicht zulässig.
+// Korrekturen müssen per Storno/Gegenbuchung erfasst werden.
+// Ein BEFORE DELETE Trigger auf DB-Ebene (trg_payments_delete_blocked) sorgt
+// zusätzlich für Schutz bei direktem DB-Zugriff.
+router.delete("/api/payments/:id", isAuthenticated, requireRole('property_manager', 'finance'), (_req, res) => {
+  return res.status(405).json({
+    error: "Zahlungen können nicht gelöscht werden. Korrekturen bitte per Storno/Gegenbuchung erfassen.",
+    code: "PAYMENT_DELETE_NOT_ALLOWED",
+  });
 });
 
 router.get("/api/payments/:id", isAuthenticated, async (req: any, res) => {

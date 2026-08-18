@@ -38,7 +38,7 @@ const DARK = {
 export default function ScanScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { user, logout, setCurrentScan, apiRequest } = useAuth();
+  const { user, logout, setCurrentScan, apiRequest, pendingCount } = useAuth();
 
   const [scanning,  setScanning]  = useState(false);
   const [scanLabel, setScanLabel] = useState('');
@@ -229,6 +229,18 @@ export default function ScanScreen() {
         </View>
       </View>
 
+      {/* ── Pending corrections banner ──────────────────── */}
+      {pendingCount > 0 && (
+        <View style={styles.pendingBanner} testID="pending-corrections-banner">
+          <Ionicons name="cloud-upload-outline" size={14} color="#92400E" />
+          <Text style={styles.pendingBannerText}>
+            {pendingCount === 1
+              ? '1 Korrektur wartet auf Übertragung'
+              : `${pendingCount} Korrekturen warten auf Übertragung`}
+          </Text>
+        </View>
+      )}
+
       {/* ── Viewfinder ──────────────────────────────────── */}
       <View style={styles.finderArea}>
         <Animated.View style={[styles.finder, { transform: [{ scale: pulse }] }]}>
@@ -306,6 +318,25 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     paddingHorizontal: 20,
     paddingBottom: 16,
+  },
+  pendingBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#FEF3C7',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#FCD34D',
+  },
+  pendingBannerText: {
+    flex: 1,
+    color: '#92400E',
+    fontSize: 13,
+    fontFamily: 'Inter_400Regular',
   },
   topLeft: {},
   appTitle: {

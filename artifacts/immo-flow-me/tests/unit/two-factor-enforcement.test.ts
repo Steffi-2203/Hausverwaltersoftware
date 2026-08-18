@@ -15,9 +15,14 @@ import request from "supertest";
 import { randomUUID } from "crypto";
 
 import { rootDb } from "../../server/db";
+import { TokenLookupDbError } from "../../server/auth";
 import * as schema from "@shared/schema";
 import { eq, inArray } from "drizzle-orm";
-import { enforcePrivileged2FA, isPrivileged2FACompliant } from "../../server/auth";
+import {
+  enforcePrivileged2FA,
+  createEnforcePrivileged2FA,
+  isPrivileged2FACompliant,
+} from "../../server/auth";
 
 const uid = () => randomUUID();
 const ADMIN_NO_2FA = uid();
@@ -152,5 +157,38 @@ describe("2FA-Erzwingung für privilegierte Rollen", () => {
     assert.equal(await isPrivileged2FACompliant(ADMIN_NO_2FA), false);
     assert.equal(await isPrivileged2FACompliant(ADMIN_WITH_2FA), true);
     assert.equal(await isPrivileged2FACompliant(VIEWER_NO_2FA), true);
+  });
+
+  test("DB-Fehler im Token-Lookup-Pfad → 503 retryable statt 500", async () => {
+    // Über createEnforcePrivileged2FA wird ein gefälschter Token-Resolver
+    // injiziert, der TokenLookupDbError wirft. So wird kein globaler Zustand
+    // mutiert — der Test läuft concurrency-safe neben allen anderen Testdateien.
+    const failingMiddleware = createEnforcePrivileged2FA(async () => {
+      throw new TokenLookupDbError(new Error("simulated DB connection failure"));
+    });
+
+    const app = express();
+    app.use((req: any, _res, next) => {
+      req.session = {}; // kein userId → Token-Resolver wird aufgerufen
+      next();
+    });
+    app.use(failingMiddleware as any);
+    app.get("/api/resource", (_req, res) => res.json({ ok: true }));
+    // Dieser Handler darf NICHT erreicht werden — käme er, wäre der Status 500
+    app.use((_err: any, _req: any, res: any, _next: any) =>
+      res.status(500).json({ error: "boom" }),
+    );
+
+    const r = await request(app)
+      .get("/api/resource")
+      .set("Authorization", "Bearer some-fake-token");
+
+    assert.equal(
+      r.status,
+      503,
+      `Erwartet 503, bekam ${r.status}: ${JSON.stringify(r.body)}`,
+    );
+    assert.equal(r.body.retryable, true, "retryable fehlt im Response");
+    assert.equal(r.body.code, "TOKEN_DB_ERROR", "code fehlt im Response");
   });
 });

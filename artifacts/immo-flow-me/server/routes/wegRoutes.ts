@@ -411,6 +411,22 @@ router.post("/api/weg/budget-lines", async (req: Request, res: Response) => {
     const body = objectToCamelCase(req.body);
     const plan = await db.select().from(schema.wegBudgetPlans).where(and(eq(schema.wegBudgetPlans.id, body.budgetPlanId), eq(schema.wegBudgetPlans.organizationId, ctx.orgId))).limit(1);
     if (!plan.length) return res.status(403).json({ error: "Zugriff verweigert" });
+    if (plan[0].status !== 'entwurf') {
+      return res.status(409).json({ error: "Budgetzeilen können nur im Status 'entwurf' angelegt werden" });
+    }
+    // Duplikat-Check: gleiche Kategorie (case-insensitiv) bereits im Plan?
+    if (body.category) {
+      const dup = await db.select({ id: schema.wegBudgetLines.id })
+        .from(schema.wegBudgetLines)
+        .where(and(
+          eq(schema.wegBudgetLines.budgetPlanId, body.budgetPlanId),
+          sql`lower(${schema.wegBudgetLines.category}) = lower(${body.category})`
+        ))
+        .limit(1);
+      if (dup.length) {
+        return res.status(409).json({ error: `Eine Budgetzeile mit der Kategorie '${body.category}' existiert bereits in diesem Plan.` });
+      }
+    }
     const [created] = await db.insert(schema.wegBudgetLines).values(body).returning();
     res.json(objectToSnakeCase(created));
   } catch (error) {
@@ -452,6 +468,21 @@ router.patch("/api/weg/budget-lines/:id", async (req: Request, res: Response) =>
     const VALID_ALLOCATION_KEYS = ['mea', 'nutzwert', 'nutzflaeche', 'einheiten', 'verbrauch'];
     if (patch.allocationKey !== undefined && !VALID_ALLOCATION_KEYS.includes(patch.allocationKey as string)) {
       return res.status(400).json({ error: `Ungültiger Verteilungsschlüssel. Erlaubt: ${VALID_ALLOCATION_KEYS.join(', ')}` });
+    }
+
+    // Duplikat-Check bei Kategorie-Änderung (case-insensitiv, eigene Zeile ausschließen)
+    if (patch.category !== undefined) {
+      const dup = await db.select({ id: schema.wegBudgetLines.id })
+        .from(schema.wegBudgetLines)
+        .where(and(
+          eq(schema.wegBudgetLines.budgetPlanId, line[0].budgetPlanId),
+          sql`lower(${schema.wegBudgetLines.category}) = lower(${patch.category as string})`,
+          sql`${schema.wegBudgetLines.id} != ${req.params.id}::uuid`
+        ))
+        .limit(1);
+      if (dup.length) {
+        return res.status(409).json({ error: `Eine Budgetzeile mit der Kategorie '${patch.category}' existiert bereits in diesem Plan.` });
+      }
     }
 
     const [updated] = await db.update(schema.wegBudgetLines)

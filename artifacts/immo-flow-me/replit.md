@@ -83,3 +83,16 @@ The frontend utilizes React 18, Vite, Tailwind CSS, and shadcn/ui for a responsi
 - **web-push**: Push notification delivery.
 - **otpauth**: TOTP generation and verification.
 - **qrcode**: QR code generation.
+
+## Operations
+
+### Feldverschlüsselungs-Schlüsselrotation (IBAN/BIC)
+Vollständiges Runbook: `docs/key-rotation-runbook.md`
+
+Kurzfassung:
+1. Neuen Schlüssel erzeugen: `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`
+2. In Produktions-Deployment-Secrets: `FIELD_ENCRYPTION_KEY_OLD` = aktueller Key, `FIELD_ENCRYPTION_KEY` = neuer Key setzen
+3. Deployen → Boot-Migration rotiert automatisch alle 8 Tabellen (fail-closed: kein Start bei Fehler)
+4. Verifizieren: `pnpm --filter @workspace/immo-flow-me run verify-encryption`
+5. `FIELD_ENCRYPTION_KEY_OLD` aus Secrets entfernen, erneut deployen
+6. **Rollback** (solange `_OLD` noch gesetzt): Keys **tauschen** — `FIELD_ENCRYPTION_KEY`=alt, `FIELD_ENCRYPTION_KEY_OLD`=neu → deployen → Boot-Migration rotiert zurück → verifizieren → `_OLD` löschen. Nie einfach KEY zurücksetzen ohne KEY_OLD zu tauschen — bereits rotierte Datensätze würden unlesbar. Vollständiges Verfahren: `docs/key-rotation-runbook.md`

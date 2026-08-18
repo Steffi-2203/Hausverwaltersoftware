@@ -151,4 +151,5 @@ describe('correctionQueue', () => {
     assert.equal(await queue.countForUser('user-X'), 2);
     assert.equal(await queue.countForUser('user-Y'), 0, 'other user count unaffected');
   });
+
 });

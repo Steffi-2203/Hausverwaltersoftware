@@ -14,6 +14,7 @@ import { useQuery } from '@tanstack/react-query';
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '@/context/AuthContext';
 import { useColors } from '@/hooks/useColors';
+import { MrgPropertyBadge } from '@/components/MrgPropertyBadge';
 
 interface PropertyListItem {
   id: string;
@@ -22,6 +23,9 @@ interface PropertyListItem {
   city?: string;
   total_units?: number;
   rented_units?: number;
+  /** 'mietverwaltung' | 'weg' | null — vom Server zurückgegeben */
+  management_type?: string | null;
+  managementType?: string | null;
 }
 
 export default function PropertiesScreen() {
@@ -87,32 +91,42 @@ export default function PropertiesScreen() {
             </Text>
           </View>
         }
-        renderItem={({ item }) => (
-          <Pressable
-            style={({ pressed }) => [
-              styles.card,
-              { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
-            ]}
-            onPress={() => router.push(`/properties/${item.id}`)}
-            testID={`property-${item.id}`}
-          >
-            <View style={[styles.iconWrap, { backgroundColor: colors.primary + '22' }]}>
-              <Feather name="home" size={20} color={colors.primary} />
-            </View>
-            <View style={styles.cardBody}>
-              <Text style={[styles.cardTitle, { color: colors.text }]} numberOfLines={1}>
-                {item.name}
-              </Text>
-              <Text style={[styles.cardSub, { color: colors.mutedForeground }]} numberOfLines={1}>
-                {[item.address, item.city].filter(Boolean).join(', ') || '—'}
-              </Text>
-              <Text style={[styles.cardMeta, { color: colors.mutedForeground }]}>
-                {item.total_units ?? 0} Einheiten · {item.rented_units ?? 0} vermietet
-              </Text>
-            </View>
-            <Feather name="chevron-right" size={20} color={colors.mutedForeground} />
-          </Pressable>
-        )}
+        renderItem={({ item }) => {
+          const isMietverwaltung =
+            (item.management_type ?? item.managementType) === 'mietverwaltung';
+
+          return (
+            <Pressable
+              style={({ pressed }) => [
+                styles.card,
+                { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
+              ]}
+              onPress={() => router.push(`/properties/${item.id}`)}
+              testID={`property-${item.id}`}
+            >
+              <View style={[styles.iconWrap, { backgroundColor: colors.primary + '22' }]}>
+                <Feather name="home" size={20} color={colors.primary} />
+              </View>
+              <View style={styles.cardBody}>
+                <Text style={[styles.cardTitle, { color: colors.text }]} numberOfLines={1}>
+                  {item.name}
+                </Text>
+                <Text style={[styles.cardSub, { color: colors.mutedForeground }]} numberOfLines={1}>
+                  {[item.address, item.city].filter(Boolean).join(', ') || '—'}
+                </Text>
+                <Text style={[styles.cardMeta, { color: colors.mutedForeground }]}>
+                  {item.total_units ?? 0} Einheiten · {item.rented_units ?? 0} vermietet
+                </Text>
+              </View>
+              {/* MRG-Ampel-Badge: nur für Mietverwaltungs-Liegenschaften */}
+              <MrgPropertyBadge
+                propertyId={item.id}
+                isMietverwaltung={isMietverwaltung}
+              />
+              <Feather name="chevron-right" size={20} color={colors.mutedForeground} />
+            </Pressable>
+          );
+        }}
       />
     </View>
   );

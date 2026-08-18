@@ -15,9 +15,9 @@ import assert from "node:assert/strict";
 import express from "express";
 import request from "supertest";
 import { v4 as uuidv4 } from "uuid";
-import { eq } from "drizzle-orm";
 import { rootDb } from "../../server/db";
 import * as schema from "../../shared/schema";
+import { cleanupOrgById } from "../../scripts/cleanup-test-data";
 import { rlsMiddleware } from "../../server/middleware/rlsMiddleware";
 import { storage } from "../../server/storage";
 
@@ -95,16 +95,12 @@ describe("cross-org storage isolation via rlsMiddleware", () => {
   });
 
   after(async () => {
-    // Clean up — order matters for FK constraints
-    await rootDb
-      .delete(schema.properties)
-      .where(eq(schema.properties.id, propertyA.id));
-    await rootDb
-      .delete(schema.organizations)
-      .where(eq(schema.organizations.id, orgA.id));
-    await rootDb
-      .delete(schema.organizations)
-      .where(eq(schema.organizations.id, orgB.id));
+    // cleanupOrgById() löscht alle FK-Abhängigkeiten in korrekter topologischer
+    // Reihenfolge (Blätter zuerst) und dann die Organisation selbst.
+    // Wirft bei Fehler — kein silent-ignore.
+    for (const org of [orgA, orgB]) {
+      await cleanupOrgById(org.id);
+    }
   });
 
   it("Org-B cannot read Org-A's property via storage.getProperties()", async () => {

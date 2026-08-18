@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { correctionQueue } from '@/utils/pendingCorrections';
+import { saveCorrection, type UploadFn } from '@/utils/saveCorrection';
 import {
   ActivityIndicator,
   Alert,
@@ -58,7 +59,7 @@ export default function ReviewScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { currentScan, setCurrentScan, apiRequest, user } = useAuth();
+  const { currentScan, setCurrentScan, apiRequest, user, refreshPendingCount } = useAuth();
 
   const [saving, setSaving] = useState(false);
 
@@ -132,47 +133,37 @@ export default function ReviewScreen() {
           fileName:      currentScan?.fileName ?? 'mobile_scan',
         };
 
-        // ── Durable outbox: persist BEFORE any network attempt ──────────────
-        // The item survives even if the OS terminates the app mid-request.
-        const userId  = user?.id ?? 'unknown';
-        const queueId = await correctionQueue.enqueue(userId, payload);
+        // ── Durable-outbox save via saveCorrection ──────────────────────────
+        // Enqueues BEFORE the network attempt — survives process kill.
+        // Returns { outcome, retryable } so we can show the right message.
+        const upload: UploadFn = (p, signal) =>
+          apiRequest('/api/ocr/corrections', { method: 'POST', body: JSON.stringify(p), signal });
 
-        // ── Attempt upload with timeout ─────────────────────────────────────
-        let uploaded = false;
-        try {
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 15_000);
-          let res: Response;
-          try {
-            res = await apiRequest('/api/ocr/corrections', {
-              method: 'POST',
-              body:   JSON.stringify(payload),
-              signal: controller.signal,
-            });
-          } finally {
-            clearTimeout(timeout);
-          }
-          if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            throw new Error(err.error ?? 'Korrekturen konnten nicht gespeichert werden.');
-          }
-          // Success — remove from durable queue, it is already on the server.
-          await correctionQueue.remove(queueId);
-          uploaded = true;
-        } catch {
-          // Network error or timeout — item stays in queue for the next flush.
+        const saveResult = await saveCorrection(payload, {
+          queue:  correctionQueue,
+          upload,
+          userId: user?.id ?? 'unknown',
+        });
+
+        if (saveResult.outcome === 'queued') {
+          // Update the scan-screen badge immediately so the manager sees the
+          // queued item as soon as they are returned to the scan screen.
+          refreshPendingCount();
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
           Alert.alert(
             'Offline gespeichert',
-            'Die Korrekturen konnten gerade nicht übertragen werden und wurden lokal gespeichert. ' +
-            'Beim nächsten App-Start werden sie automatisch nachgesendet.',
+            saveResult.retryable
+              ? 'Der Server ist vorübergehend nicht erreichbar. Die Korrekturen wurden lokal gespeichert ' +
+                'und werden automatisch nachgesendet sobald der Dienst wieder verfügbar ist.'
+              : 'Die Korrekturen konnten gerade nicht übertragen werden und wurden lokal gespeichert. ' +
+                'Beim nächsten App-Start werden sie automatisch nachgesendet.',
           );
           setCurrentScan(null);
           router.back();
           return;
         }
 
-        if (uploaded) {
+        if (saveResult.outcome === 'uploaded') {
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         }
       }

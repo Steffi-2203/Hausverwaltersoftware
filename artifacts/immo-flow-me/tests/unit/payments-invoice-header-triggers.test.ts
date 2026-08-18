@@ -11,7 +11,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { rootDb as db } from '../../server/db';
+import { rootDb as db, pool } from '../../server/db';
 import { sql } from 'drizzle-orm';
 import { randomUUID } from 'node:crypto';
 
@@ -154,5 +154,53 @@ describe('Header-Trigger: payments + monthly_invoices unveränderliche Kernfelde
     );
     const r = await db.execute(sql`SELECT status FROM monthly_invoices WHERE id = ${invoiceId}::uuid`);
     assert.equal((r.rows[0] as any).status, 'teilbezahlt');
+  });
+
+  // ── payments DELETE-Trigger ─────────────────────────────────────────────────
+
+  it('Trigger trg_payments_delete_blocked existiert auf payments', async () => {
+    assert.equal(await triggerExists('trg_payments_delete_blocked', 'payments'), true);
+  });
+
+  it('DELETE aus App-Kontext (app.current_org gesetzt) → Trigger blockiert', async () => {
+    // SET LOCAL ist transaktionsgebunden — wir brauchen eine explizite Transaktion.
+    // pool.connect() liefert eine rohe pg-Verbindung (umgeht drizzle-Autocommit).
+    const client = await (pool as any).connect();
+    try {
+      await client.query('BEGIN');
+      // SET does not accept parameter placeholders ($1) — use literal interpolation.
+      // orgId is a test-generated UUID, no injection risk.
+      await client.query(`SET LOCAL "app.current_org" = '${orgId}'`);
+      await assert.rejects(
+        client.query(`DELETE FROM payments WHERE id = $1`, [paymentId]),
+        (err: any) => {
+          const msg = err?.message ?? '';
+          assert.match(msg, /Löschen ist nicht zulässig/);
+          return true;
+        },
+      );
+      // Rollback: nothing was deleted (trigger fired before completion)
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+    // Zahlung muss nach dem Trigger-Blockieren noch vorhanden sein
+    const r = await db.execute(sql`SELECT id FROM payments WHERE id = ${paymentId}::uuid`);
+    assert.equal((r.rows?.length ?? 0), 1, 'Zahlung muss noch in der DB sein');
+  });
+
+  it('DELETE ohne App-Kontext (System-Operation via rootDb) → erlaubt; Cleanup funktioniert', async () => {
+    // Verifiziert dass das after()-Cleanup dieser Testsuite funktioniert:
+    // rootDb läuft ohne app.current_org → Trigger feuert nicht.
+    // Wir legen einen zweiten temporären Datensatz an und löschen ihn sofort.
+    const tmpId = randomUUID();
+    await db.execute(sql`
+      INSERT INTO payments (id, tenant_id, betrag, buchungs_datum)
+      VALUES (${tmpId}::uuid, ${tenantId}::uuid, 1, '2026-01-01')
+    `);
+    // rootDb hat kein app.current_org → Delete muss gelingen
+    await db.execute(sql`DELETE FROM payments WHERE id = ${tmpId}::uuid`);
+    const r = await db.execute(sql`SELECT id FROM payments WHERE id = ${tmpId}::uuid`);
+    assert.equal((r.rows?.length ?? 0), 0, 'Temporäre Zahlung muss gelöscht sein');
   });
 });

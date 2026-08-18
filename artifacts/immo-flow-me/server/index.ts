@@ -7,7 +7,11 @@ import rateLimit from "express-rate-limit";
 import onFinished from "on-finished";
 import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
-import "./lib/immutableViolationAudit"; // Registriert den P0001-Audit-Handler (Task #89)
+// P0001-Audit-Handler: Erstregistrierung erfolgt jetzt bereits über den
+// Bottom-of-file-Import in server/db.ts (garantiert auch in Skript-Kontexten).
+// Dieser Import bleibt als Belt-and-Suspenders und ist ein No-Op wenn
+// immutableViolationAudit.ts bereits via db.ts geladen wurde.
+import "./lib/immutableViolationAudit";
 import { parseEncryptionKey } from "./lib/fieldEncryption";
 import { registerDsgvoRoutes } from "./routes/dsgvoRoutes";
 import { registerSecurityRoutes, trackSession } from "./routes/securityRoutes";

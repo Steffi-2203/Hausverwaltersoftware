@@ -14,6 +14,12 @@ import { useQueries, useQuery } from '@tanstack/react-query';
 import { Feather } from '@expo/vector-icons';
 import { useAuth } from '@/context/AuthContext';
 import { useColors } from '@/hooks/useColors';
+import {
+  type MrgCheck,
+  type MrgStatus,
+  deriveStatus,
+  STATUS_META,
+} from '@/utils/mrgStatus';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -31,30 +37,6 @@ interface UnitWithTenants {
   flaeche?: string | number | null;
   tenants?: TenantLite[];
 }
-
-interface MrgCheck {
-  ueberschritten: boolean;
-  differenz: number;
-  zulassigerHmz: number | null;
-  berechnungsgrundlage: string;
-}
-
-type MrgStatus = 'ok' | 'grenzwertig' | 'ueberschritten' | 'nicht_anwendbar';
-
-// Same derivation as the web PropertyDetail MRG-Ampel.
-function deriveStatus(check: MrgCheck | undefined, grundmiete: number): MrgStatus {
-  if (!check || check.zulassigerHmz === null) return 'nicht_anwendbar';
-  if (check.ueberschritten) return 'ueberschritten';
-  if (check.zulassigerHmz > 0 && grundmiete / check.zulassigerHmz >= 0.9) return 'grenzwertig';
-  return 'ok';
-}
-
-const STATUS_META: Record<MrgStatus, { label: string; icon: keyof typeof Feather.glyphMap }> = {
-  ok:              { label: 'OK',              icon: 'check-circle' },
-  grenzwertig:     { label: 'Grenzwertig',     icon: 'alert-triangle' },
-  ueberschritten:  { label: 'Überschritten',   icon: 'x-circle' },
-  nicht_anwendbar: { label: 'Nicht anwendbar', icon: 'minus-circle' },
-};
 
 function formatEur(v: number): string {
   return v.toLocaleString('de-AT', { style: 'currency', currency: 'EUR' });

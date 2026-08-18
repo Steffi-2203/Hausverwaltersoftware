@@ -211,4 +211,63 @@ describe("POST /api/payments — Cross-Org-Schutz (Zahlung auf fremden Mieter)",
       .expect(201);
     assert.equal(res.body.invoiceId, invA);
   });
+
+  test("DELETE /api/payments/:id → 405 (Löschen nicht erlaubt)", async () => {
+    // Zahlung ist unveränderlich — Löschen ist prinzipiell verboten.
+    // Der Endpunkt gibt 405 zurück, bevor er überhaupt die DB berührt.
+    // Kein bestehender Datensatz nötig — der Handler prüft die ID gar nicht.
+    const fakeId = randomUUID();
+    const res = await request(appA)
+      .delete(`/api/payments/${fakeId}`)
+      .expect(405);
+    assert.equal(res.body.code, "PAYMENT_DELETE_NOT_ALLOWED");
+    assert.ok(
+      res.body.error.includes("nicht gelöscht"),
+      `Erwarte Hinweis auf Storno, bekam: ${res.body.error}`,
+    );
+  });
+
+  // ── Task #175: geschützte Felder sauber abfangen ───────────────────────────
+
+  test("PATCH betrag → 422 mit Storno-Hinweis (Vorab-Prüfung)", async () => {
+    assert.ok(createdPaymentIds.length > 0, "Positivfall muss zuvor eine Zahlung angelegt haben");
+    const paymentId = createdPaymentIds[0];
+    const res = await request(appA)
+      .patch(`/api/payments/${paymentId}`)
+      .send({ betrag: "9999.00" })
+      .expect(422);
+    assert.equal(res.body.code, "PAYMENT_IMMUTABLE_FIELD");
+    assert.ok(
+      res.body.error.includes("Storno") || res.body.error.includes("Gegenbuchung"),
+      `Erwarte Storno-Hinweis, bekam: ${res.body.error}`,
+    );
+    assert.ok(
+      Array.isArray(res.body.fields) && res.body.fields.includes("betrag"),
+      `Erwarte 'betrag' in fields, bekam: ${JSON.stringify(res.body.fields)}`,
+    );
+    // Betrag darf sich nicht geändert haben
+    const row: any = await db.execute(sql`SELECT betrag FROM payments WHERE id = ${paymentId}::uuid`);
+    const betrag = Number((row.rows?.[0] ?? row[0])?.betrag);
+    assert.notEqual(betrag, 9999, "Betrag darf nicht verändert worden sein");
+  });
+
+  test("PATCH buchungs_datum → 422 mit Storno-Hinweis", async () => {
+    assert.ok(createdPaymentIds.length > 0);
+    const paymentId = createdPaymentIds[0];
+    const res = await request(appA)
+      .patch(`/api/payments/${paymentId}`)
+      .send({ buchungs_datum: "2099-12-31" })
+      .expect(422);
+    assert.equal(res.body.code, "PAYMENT_IMMUTABLE_FIELD");
+  });
+
+  test("PATCH notizen → 200 (erlaubtes Feld bleibt änderbar)", async () => {
+    assert.ok(createdPaymentIds.length > 0);
+    const paymentId = createdPaymentIds[0];
+    const res = await request(appA)
+      .patch(`/api/payments/${paymentId}`)
+      .send({ notizen: "Testkorretur-Notiz 175" })
+      .expect(200);
+    assert.equal(res.body.notizen, "Testkorretur-Notiz 175");
+  });
 });

@@ -1,6 +1,9 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { AppState, AppStateStatus } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { correctionQueue } from '@/utils/pendingCorrections';
+import { flushCorrections } from '@/utils/flushCorrections';
+import { createRaceSafeLoader } from '@/utils/raceSafeCountLoader';
 import { apiRequest as _apiRequest } from '@/utils/apiRequest';
 import { loginRequest } from '@/utils/loginRequest';
 
@@ -51,6 +54,13 @@ interface AuthContextType {
   apiRequest: (path: string, options?: RequestInit, timeoutMs?: number) => Promise<Response>;
   /** Retry all locally-queued OCR corrections. Returns the number flushed. */
   flushPendingCorrections: () => Promise<number>;
+  /** Number of corrections waiting to be transmitted (0 when none pending). */
+  pendingCount: number;
+  /**
+   * Re-read the queue and update pendingCount.
+   * Call after any operation that may add items to the queue (e.g. a failed save).
+   */
+  refreshPendingCount: () => void;
 }
 
 // ── Context ──────────────────────────────────────────────────────────────────
@@ -61,17 +71,46 @@ const TOKEN_KEY = 'immo_ocr_token';
 const USER_KEY  = 'immo_ocr_user';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [token,       setToken]       = useState<string | null>(null);
-  const [user,        setUser]        = useState<AuthUser | null>(null);
-  const [isLoading,   setIsLoading]   = useState(true);
-  const [currentScan, setCurrentScan] = useState<ScanResult | null>(null);
+  const [token,        setToken]        = useState<string | null>(null);
+  const [user,         setUser]         = useState<AuthUser | null>(null);
+  const [isLoading,    setIsLoading]    = useState(true);
+  const [currentScan,  setCurrentScan]  = useState<ScanResult | null>(null);
+  const [pendingCount, setPendingCount] = useState<number>(0);
 
   const apiDomain = process.env.EXPO_PUBLIC_DOMAIN ?? '';
 
-  // Keep a stable ref to the latest token so flushPendingCorrections always
-  // uses the current value even if called before a re-render.
-  const tokenRef = useRef<string | null>(null);
-  tokenRef.current = token;
+  // Keep stable refs so flushPendingCorrections always reads the latest
+  // values even when called from a closure that captured stale state
+  // (e.g. the AppState listener registered with [] dependencies).
+  const tokenRef   = useRef<string | null>(null);
+  const userRef    = useRef<AuthUser | null>(null);
+  const flushingRef = useRef<boolean>(false); // in-flight guard
+  tokenRef.current  = token;
+  userRef.current   = user;
+
+  // Monotonic-generation count loader — created once for the lifetime of the
+  // provider. load() increments the internal generation so only the latest
+  // outstanding read can ever apply. invalidate() bumps the generation on
+  // logout/login so pre-transition reads (including same-account re-logins)
+  // are always discarded.
+  const countLoaderRef = useRef(
+    createRaceSafeLoader(
+      uid => correctionQueue.countForUser(uid),
+      ()  => userRef.current?.id,
+      setPendingCount,
+    )
+  );
+
+  /**
+   * Public: re-read the queue and update pendingCount.
+   * Call after any operation that may have added items to the queue
+   * (e.g. a failed save in review.tsx) so the scan-screen badge reflects
+   * the current state immediately, without waiting for the next flush.
+   */
+  function refreshPendingCount() {
+    const uid = userRef.current?.id;
+    if (uid) countLoaderRef.current.load(uid);
+  }
 
   useEffect(() => {
     (async () => {
@@ -81,8 +120,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           SecureStore.getItemAsync(USER_KEY),
         ]);
         if (storedToken && storedUser) {
+          const parsedUser = JSON.parse(storedUser) as AuthUser;
           setToken(storedToken);
-          setUser(JSON.parse(storedUser) as AuthUser);
+          setUser(parsedUser);
+          // Load pending count immediately so the badge appears before flush completes.
+          countLoaderRef.current.load(parsedUser.id);
         }
       } catch {
         // ignore — treat as logged out
@@ -98,6 +140,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     flushPendingCorrections().catch(() => {/* silent — will retry on next startup */});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
+
+  // Also flush when the app returns to the foreground — catches the case
+  // where a 503 kept an item queued and the DB has since recovered.
+  // flushPendingCorrections reads tokenRef.current, so no closure risk.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state: AppStateStatus) => {
+      if (state === 'active') {
+        flushPendingCorrections().catch(() => {/* silent — retry on next foreground */});
+      }
+    });
+    return () => sub.remove();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function apiRequest(
     path: string,
@@ -120,54 +175,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       SecureStore.setItemAsync(TOKEN_KEY, data.token),
       SecureStore.setItemAsync(USER_KEY,  JSON.stringify(newUser)),
     ]);
+    // Discard any in-flight reads from a prior session before starting the
+    // new one — protects against same-account re-login stale reads.
+    countLoaderRef.current.invalidate();
     setToken(data.token);
     setUser(newUser);
+    // Load queue count for the newly logged-in user so the badge reflects
+    // any offline-queued corrections that accumulated while logged out.
+    countLoaderRef.current.load(newUser.id);
   }
 
   async function flushPendingCorrections(): Promise<number> {
-    const currentToken = tokenRef.current;
-    if (!currentToken) return 0;
+    // In-flight guard: prevent overlapping flushes from token-change and
+    // foreground events racing each other and submitting the same item twice.
+    if (flushingRef.current) return 0;
 
-    // Only flush items that belong to the currently authenticated user to
-    // prevent cross-account data leakage on shared devices.
-    const currentUserId = user?.id;
-    if (!currentUserId) return 0;
+    // Read via refs so this function is safe to call from closures that
+    // captured stale state (e.g. the AppState listener with [] deps).
+    const currentToken  = tokenRef.current;
+    const currentUserId = userRef.current?.id;
+    if (!currentToken || !currentUserId) return 0;
 
-    const queue = await correctionQueue.getForUser(currentUserId);
-    if (queue.length === 0) return 0;
-
-    let flushed = 0;
-    for (const item of queue) {
-      try {
-        const url = `https://${apiDomain}/api/ocr/corrections`;
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15_000);
-        let res: Response;
-        try {
-          res = await fetch(url, {
-            method:  'POST',
-            headers: {
-              'Content-Type':  'application/json',
-              'Authorization': `Bearer ${currentToken}`,
-            },
-            body:   JSON.stringify(item.payload),
-            signal: controller.signal,
-          });
-        } finally {
-          clearTimeout(timeout);
-        }
-        if (res.ok) {
-          await correctionQueue.remove(item.id);
-          flushed++;
-        }
-        // 401 = token expired; stop early so we don't burn through the queue.
-        if (res.status === 401) break;
-      } catch {
-        // Network error or timeout — stop and retry on next startup.
-        break;
-      }
+    flushingRef.current = true;
+    try {
+      const n = await flushCorrections({
+        token:     currentToken,
+        userId:    currentUserId,
+        apiDomain,
+        queue:     correctionQueue,
+        fetchFn:   fetch,
+      });
+      // Refresh badge after each flush attempt so it reflects the current queue.
+      countLoaderRef.current.load(currentUserId);
+      return n;
+    } finally {
+      flushingRef.current = false;
     }
-    return flushed;
   }
 
   async function logout(): Promise<void> {
@@ -175,14 +218,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       SecureStore.deleteItemAsync(TOKEN_KEY),
       SecureStore.deleteItemAsync(USER_KEY),
     ]);
+    // Discard any in-flight count reads before clearing state.
+    countLoaderRef.current.invalidate();
     setToken(null);
     setUser(null);
     setCurrentScan(null);
+    setPendingCount(0);
   }
 
   return (
     <AuthContext.Provider
-      value={{ token, user, isLoading, login, logout, currentScan, setCurrentScan, apiRequest, flushPendingCorrections }}
+      value={{ token, user, isLoading, login, logout, currentScan, setCurrentScan, apiRequest, flushPendingCorrections, pendingCount, refreshPendingCount }}
     >
       {children}
     </AuthContext.Provider>
