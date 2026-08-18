@@ -189,12 +189,15 @@ async function resolveTokenAuth(req: Request): Promise<boolean> {
     `);
     const rows = result.rows as any[];
     if (rows.length > 0) {
-      req.session.userId = rows[0].user_id;
       const profile = await getProfileById(rows[0].user_id);
-      if (profile) {
-        req.session.email = profile.email;
-        (req.session as any).organizationId = profile.organizationId ?? undefined;
+      if (!profile) {
+        // Token gültig, aber Profil fehlt (FK-Cascade-Lücke oder Race Condition).
+        // Fail-closed: kein Zugang ohne vollständiges Profil.
+        return false;
       }
+      req.session.userId = rows[0].user_id;
+      req.session.email = profile.email;
+      (req.session as any).organizationId = profile.organizationId ?? undefined;
       return true;
     }
   } catch (e) {
@@ -249,6 +252,12 @@ export function createEnforcePrivileged2FA(
       if (!path.startsWith("/api/")) return next();
       if (TWO_FA_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return next();
 
+      // Task #195: Abgelaufener/gefälschter Bearer-Token darf privilegierte Routen
+      // nicht über eine vorhandene Session-Cookie umgehen.
+      if ((req as any)._bearerTokenRejected) {
+        return res.status(401).json({ message: "Unauthorized", code: "TOKEN_INVALID_OR_EXPIRED" });
+      }
+
       const s = req.session as any;
       if (!s?.userId) {
         // Bearer-Token-Clients (Mobile) hier auflösen, damit auch sie geprüft
@@ -301,6 +310,12 @@ export function createEnforcePrivileged2FA(
 export const enforcePrivileged2FA = createEnforcePrivileged2FA();
 
 export function isAuthenticated(req: Request, res: Response, next: NextFunction) {
+  // Task #195: Abgelaufene/gefälschte Bearer-Tokens dürfen NICHT "still" durch
+  // eine vorhandene Session-Cookie akzeptiert werden. Das Flag wird von
+  // bearerSessionHydration gesetzt, wenn der Bearer-Token vorhanden aber ungültig ist.
+  if ((req as any)._bearerTokenRejected) {
+    return res.status(401).json({ message: "Unauthorized", code: "TOKEN_INVALID_OR_EXPIRED" });
+  }
   if (req.session?.userId) {
     return next();
   }
@@ -548,6 +563,13 @@ export function setupAuth(app: Express) {
       console.error("Register error:", error);
       res.status(500).json({ error: "Registrierung fehlgeschlagen" });
     }
+  });
+
+  // Lightweight token validation endpoint for mobile clients.
+  // Returns 200 { valid: true } when the Bearer token is valid.
+  // isAuthenticated returns 401 automatically when the token is expired or forged.
+  app.get("/api/auth/validate", isAuthenticated, (_req: Request, res: Response) => {
+    res.status(200).json({ valid: true });
   });
 
   app.post("/api/auth/login", async (req: Request, res: Response) => {

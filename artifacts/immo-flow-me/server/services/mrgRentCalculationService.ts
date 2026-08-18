@@ -40,8 +40,18 @@ export interface MrgRentInput {
   nutzflaeche:      number;        // m²
   // Richtwert-Parameter
   bundesland?:      string;
-  lagezuschlag?:    number;        // Prozent (z.B. 10 für +10%)
-  abschlaege?:      number;        // Prozent (negativ, z.B. -5 für -5%)
+  /**
+   * Lagezuschlag in €/m² (≥ 0) nach § 16 Abs. 2 MRG.
+   * Wird zum Richtwert addiert, bevor mit der Nutzfläche multipliziert wird:
+   *   HMZ = (Richtwert_€/m² + lagezuschlag + abschlaege) × m²
+   * Typische Werte: 0 – 4 €/m² (Quelle: Lagezuschlags-Rechner der Gemeinde).
+   */
+  lagezuschlag?:    number;        // €/m² (nicht Prozent)
+  /**
+   * Ausstattungs-/sonstige Abschläge in €/m² (≤ 0) nach § 16 Abs. 2 MRG.
+   * Negativer Betrag; wird ebenfalls zum Richtwert addiert (vermindert HMZ).
+   */
+  abschlaege?:      number;        // €/m² (nicht Prozent, muss ≤ 0 sein)
   // Kategorie-Parameter
   kategorie?:       keyof typeof KATEGORIE_MIETZINSE;
   // Befristungsparameter (§ 16 Abs. 7 MRG)
@@ -83,26 +93,35 @@ export function calculateMrgRent(input: MrgRentInput): MrgRentResult | null {
   if (rentType === 'richtwert') {
     const bundesland = input.bundesland ?? 'Wien';
     const baseRichtwert = RICHTWERTE_2025[bundesland] ?? RICHTWERTE_2025['Wien']!;
-    const lagezuschlag = input.lagezuschlag ?? 0;
-    const abschlaege = input.abschlaege ?? 0;
+    const lagezuschlag = input.lagezuschlag ?? 0;  // €/m²
+    const abschlaege   = input.abschlaege   ?? 0;  // €/m² (≤ 0)
 
-    // zulassigerNettomietzins = Betrag VOR Befristungsabschlag (nur Lage/Ausstattung)
-    const sumProzent = lagezuschlag + abschlaege;
-    // Volle Präzision durch alle Zu-/Abschläge tragen und erst das Endergebnis
-    // runden — Zwischenrundung vor dem 25%-Abschlag kann den HMZ um 1 Cent
+    // Gesetzeskonforme Formel nach § 16 Abs. 2 MRG:
+    //   HMZ = (Richtwert_€/m² + Lagezuschlag_€/m² + Abschläge_€/m²) × Nutzfläche_m²
+    //
+    // Die Zu-/Abschläge werden zum Richtwert addiert, BEVOR mit der Fläche
+    // multipliziert wird.  Erst das Endergebnis runden — Zwischenrundung
+    // vor dem 25%-Befristungsabschlag (§ 16 Abs. 7) kann den HMZ um 1 Cent
     // verfälschen (gesetzliche Obergrenze!).
-    const rawNetto = nutzflaeche * baseRichtwert * (1 + sumProzent / 100);
+    const rawNetto = (baseRichtwert + lagezuschlag + abschlaege) * nutzflaeche;
     const zulassigerNettomietzins = roundMoney(rawNetto);
     // zulassigerHmz = endgültiger Höchstmietzins NACH §16 Abs.7 Abschlag
     const zulassigerHmz = befristungsabschlag > 0
       ? roundMoney(rawNetto * 0.75)
       : zulassigerNettomietzins;
 
+    const lagezuschlagLabel = lagezuschlag !== 0
+      ? `, Lagezuschlag ${lagezuschlag.toFixed(2)} €/m²`
+      : '';
+    const abschlaegeLabel = abschlaege !== 0
+      ? `, Abschläge ${abschlaege.toFixed(2)} €/m²`
+      : '';
+
     return {
       zulassigerNettomietzins,
       befristungsabschlag,
       zulassigerHmz,
-      berechnungsgrundlage: `Richtwert ${bundesland} ${baseRichtwert} €/m² (§ 16 Abs. 2 MRG, Stand 2025/2026)`,
+      berechnungsgrundlage: `Richtwert ${bundesland} ${baseRichtwert} €/m²${lagezuschlagLabel}${abschlaegeLabel} (§ 16 Abs. 2 MRG, Stand 2025/2026)`,
       rentType: 'richtwert',
     };
   }

@@ -39,6 +39,59 @@ interface SonstigeKostenPosition {
   schluessel: string;
 }
 
+/**
+ * GET /api/tenants/:id gibt zusätzlich zu den Tenant-Spalten auch
+ * gemergete Lease-Felder zurück (befristet, befristungEnde, lagezuschlag,
+ * abschlaege, wasserkostenVorschuss, sonstigeKosten). Diese kommen nicht
+ * aus dem Drizzle-Schema-Typ, daher eigene Interface-Erweiterung.
+ */
+interface TenantApiResponse {
+  firstName: string;
+  lastName: string;
+  email?: string | null;
+  phone?: string | null;
+  mietbeginn?: string | null;
+  mietende?: string | null;
+  kaution?: string | number | null;
+  kautionBezahlt?: boolean;
+  grundmiete?: string | number | null;
+  betriebskostenVorschuss?: string | number | null;
+  heizkostenVorschuss?: string | number | null;
+  wasserkostenVorschuss?: string | number | null;
+  sepaMandat?: boolean;
+  iban?: string | null;
+  bic?: string | null;
+  status?: string;
+  // Lease-gemergete Felder
+  befristet?: boolean;
+  befristungEnde?: string | null;
+  befristung_ende?: string | null;
+  lagezuschlag?: number | string | null;
+  abschlaege?: number | string | null;
+  sonstigeKosten?: Record<string, { betrag?: number | string; ust?: number; schluessel?: string }> | null;
+}
+
+// Preprocessor for optional MRG €/m² fields (§ 16 Abs. 2 MRG):
+// empty string / null / undefined → null; numeric string → number.
+function mrgEurM2(direction: 'positive' | 'negative', label: string) {
+  const preprocess = (v: unknown) =>
+    v === '' || v === null || v === undefined ? null : Number(v);
+  if (direction === 'positive') {
+    return z.preprocess(
+      preprocess,
+      z.number({ invalid_type_error: `${label} muss eine Zahl sein` })
+        .min(0, `${label} muss ≥ 0 €/m² sein`)
+        .nullable()
+    );
+  }
+  return z.preprocess(
+    preprocess,
+    z.number({ invalid_type_error: `${label} muss eine Zahl sein` })
+      .max(0, `${label} muss ≤ 0 €/m² sein`)
+      .nullable()
+  );
+}
+
 const tenantSchema = z.object({
   first_name: z.string().trim().min(1, 'Vorname ist erforderlich').max(100),
   last_name: z.string().trim().min(1, 'Nachname ist erforderlich').max(100),
@@ -54,6 +107,9 @@ const tenantSchema = z.object({
   betriebskosten_vorschuss: z.coerce.number().min(0, 'BK-Vorschuss muss positiv sein'),
   heizungskosten_vorschuss: z.coerce.number().min(0, 'Heizungskosten-Vorschuss muss positiv sein'),
   wasserkosten_vorschuss: z.coerce.number().min(0, 'Wasserkosten-Vorschuss muss positiv sein'),
+  // MRG § 16 Abs. 2: Lagezuschlag/Abschläge in €/m² — nur bei mietrecht_typ='richtwert'
+  lagezuschlag: mrgEurM2('positive',  'Lagezuschlag'),
+  abschlaege:   mrgEurM2('negative',  'Abschläge'),
   sepa_mandat: z.boolean(),
   iban: z.string().trim().max(34).optional().or(z.literal('')),
   bic: z.string().trim().max(11).optional().or(z.literal('')),
@@ -83,10 +139,10 @@ export default function TenantForm() {
   const [sonstigeKosten, setSonstigeKosten] = useState<SonstigeKostenPosition[]>([]);
   
   useEffect(() => {
-    const tenantAny = tenant as any;
-    if (tenantAny?.sonstigeKosten && typeof tenantAny.sonstigeKosten === 'object') {
+    const t = tenant as TenantApiResponse | undefined;
+    if (t?.sonstigeKosten && typeof t.sonstigeKosten === 'object') {
       const positions: SonstigeKostenPosition[] = [];
-      const sk = tenantAny.sonstigeKosten as Record<string, { betrag?: number | string; ust?: number; schluessel?: string }>;
+      const sk = t.sonstigeKosten;
       for (const [name, item] of Object.entries(sk)) {
         if (item && item.betrag !== undefined) {
           positions.push({
@@ -118,33 +174,41 @@ export default function TenantForm() {
       betriebskosten_vorschuss: 0,
       heizungskosten_vorschuss: 0,
       wasserkosten_vorschuss: 0,
+      lagezuschlag: null,
+      abschlaege: null,
       sepa_mandat: false,
       iban: '',
       bic: '',
       mandat_reference: '',
       status: 'aktiv',
     },
-    values: tenant ? {
-      first_name: tenant.firstName,
-      last_name: tenant.lastName,
-      email: tenant.email || '',
-      phone: tenant.phone || '',
-      mietbeginn: tenant.mietbeginn || '',
-      mietende: tenant.mietende || '',
-      befristet: (tenant as any).befristet || false,
-      befristung_ende: (tenant as any).befristungEnde || (tenant as any).befristung_ende || '',
-      kaution: Number(tenant.kaution || 0),
-      kaution_bezahlt: tenant.kautionBezahlt || false,
-      grundmiete: Number(tenant.grundmiete || 0),
-      betriebskosten_vorschuss: Number(tenant.betriebskostenVorschuss || 0),
-      heizungskosten_vorschuss: Number(tenant.heizkostenVorschuss || 0),
-      wasserkosten_vorschuss: Number((tenant as any).wasserkostenVorschuss || 0),
-      sepa_mandat: tenant.sepaMandat || false,
-      iban: tenant.iban || '',
-      bic: tenant.bic || '',
-      mandat_reference: '',
-      status: tenant.status || 'aktiv',
-    } : undefined,
+    values: (() => {
+      if (!tenant) return undefined;
+      const t = tenant as TenantApiResponse;
+      return {
+        first_name: t.firstName,
+        last_name: t.lastName,
+        email: t.email || '',
+        phone: t.phone || '',
+        mietbeginn: tenant.mietbeginn || '',
+        mietende: tenant.mietende || '',
+        befristet: t.befristet ?? false,
+        befristung_ende: t.befristungEnde ?? t.befristung_ende ?? '',
+        kaution: Number(tenant.kaution || 0),
+        kaution_bezahlt: tenant.kautionBezahlt || false,
+        grundmiete: Number(tenant.grundmiete || 0),
+        betriebskosten_vorschuss: Number(tenant.betriebskostenVorschuss || 0),
+        heizungskosten_vorschuss: Number(tenant.heizkostenVorschuss || 0),
+        wasserkosten_vorschuss: Number(t.wasserkostenVorschuss || 0),
+        lagezuschlag: t.lagezuschlag != null ? Number(t.lagezuschlag) : null,
+        abschlaege:   t.abschlaege   != null ? Number(t.abschlaege)   : null,
+        sepa_mandat: tenant.sepaMandat || false,
+        iban: tenant.iban || '',
+        bic: tenant.bic || '',
+        mandat_reference: '',
+        status: tenant.status || 'aktiv',
+      };
+    })(),
   });
 
   const watchSepaMandat = form.watch('sepa_mandat');
@@ -203,6 +267,9 @@ export default function TenantForm() {
       betriebskostenVorschuss: String(data.betriebskosten_vorschuss),
       heizkostenVorschuss: String(data.heizungskosten_vorschuss),
       wasserkostenVorschuss: String(data.wasserkosten_vorschuss),
+      // MRG § 16 Abs. 2 — nur bei richtwert-Objekten erfasst
+      lagezuschlag: data.lagezuschlag != null ? String(data.lagezuschlag) : null,
+      abschlaege:   data.abschlaege   != null ? String(data.abschlaege)   : null,
       sonstigeKosten: Object.keys(sonstigeKostenObj).length > 0 ? sonstigeKostenObj : null,
       sepaMandat: data.sepa_mandat,
       sepaMandatDatum: null,
@@ -217,8 +284,10 @@ export default function TenantForm() {
     };
 
     if (isEditing && tenantId) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await updateTenant.mutateAsync({ id: tenantId, ...tenantData } as any);
     } else {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await createTenant.mutateAsync(tenantData as any);
     }
 
@@ -569,6 +638,81 @@ export default function TenantForm() {
               </div>
             </CardContent>
           </Card>
+
+          {/* MRG § 16 Abs. 2 — Lagezuschlag / Abschläge (nur bei Richtwert-Mietobjekten) */}
+          {property?.mietrechtTyp === 'richtwert' && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <BarChart3 className="h-5 w-5" />
+                  Lagezuschlag und Abschläge (§ 16 Abs. 2 MRG)
+                </CardTitle>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Beträge in €/m² nach § 16 Abs. 2 MRG. Der Lagezuschlag (≥ 0) wird
+                  zum Richtwert addiert, Abschläge (≤ 0) davon subtrahiert —
+                  jeweils multipliziert mit der Nutzfläche.
+                  Quellen: Lagezuschlags-Rechner der Gemeinde. Leer = nicht berücksichtigt.
+                </p>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="lagezuschlag"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="flex items-center">
+                          Lagezuschlag (€/m²)
+                          <InfoTooltip text="Objektivierter Lagezuschlag gem. § 16 Abs. 2 MRG in €/m² (z. B. aus dem Lagezuschlags-Rechner der Gemeinde). Wird zum Richtwert addiert und mit der Nutzfläche multipliziert. Typischer Bereich: 0 – 4 €/m²." />
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            placeholder="z.B. 0.50"
+                            data-testid="input-lagezuschlag"
+                            {...field}
+                            value={field.value ?? ''}
+                            onChange={(e) => field.onChange(e.target.value === '' ? null : e.target.value)}
+                          />
+                        </FormControl>
+                        <FormDescription>€/m² · ≥ 0 · Leer = nicht berücksichtigt</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="abschlaege"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="flex items-center">
+                          Abschläge (€/m²)
+                          <InfoTooltip text="Ausstattungs- oder sonstige Abschläge gem. § 16 Abs. 2 MRG in €/m² (negativer Betrag). Verringert den zulässigen Höchstmietzins. Beispiel: −0.25 für leichten Mangel." />
+                        </FormLabel>
+                        <FormControl>
+                          <Input
+                            type="number"
+                            step="0.01"
+                            max="0"
+                            placeholder="z.B. -0.25"
+                            data-testid="input-abschlaege"
+                            {...field}
+                            value={field.value ?? ''}
+                            onChange={(e) => field.onChange(e.target.value === '' ? null : e.target.value)}
+                          />
+                        </FormControl>
+                        <FormDescription>€/m² · ≤ 0 · Leer = nicht berücksichtigt</FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+          )}
 
           {/* Sonstige Kosten */}
           <Card>

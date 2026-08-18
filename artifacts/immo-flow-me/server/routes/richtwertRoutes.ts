@@ -233,8 +233,8 @@ router.get("/api/tenants/:id/mrg-check", isAuthenticated, async (req: Request, r
     const row = leaseRows[0];
     const befristet = (row?.befristet === true) || (row?.endDate != null);
 
-    // Lagezuschlag/Abschläge (Prozentwerte) aus dem Mietvertrag übernehmen,
-    // falls gespeichert — NULL/fehlend → 0 (Basisfall).
+    // Lagezuschlag/Abschläge in €/m² aus dem Mietvertrag übernehmen (§ 16 Abs. 2 MRG).
+    // NULL/fehlend → 0 (Basisfall ohne Zu-/Abschlag).
     const lagezuschlag = row?.lagezuschlag != null ? Number(row.lagezuschlag) : 0;
     const abschlaege   = row?.abschlaege   != null ? Number(row.abschlaege)   : 0;
 

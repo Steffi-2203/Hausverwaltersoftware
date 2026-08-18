@@ -263,8 +263,10 @@ export const leases = pgTable("leases", {
   // MRG-Richtwert-Parameter (§ 16 Abs. 2 MRG): Lagezuschlag in Prozent
   // (z. B. 10 für +10 %) und Ausstattungs-/sonstige Abschläge in Prozent
   // (negativ, z. B. -5 für -5 %). NULL = nicht erfasst → 0 im Check.
-  lagezuschlag: numeric("lagezuschlag", { precision: 5, scale: 2 }),
-  abschlaege: numeric("abschlaege", { precision: 5, scale: 2 }),
+  /** MRG § 16 Abs. 2: Lagezuschlag in €/m² (≥ 0). NULL = nicht erfasst. */
+  lagezuschlag: numeric("lagezuschlag", { precision: 8, scale: 2 }),
+  /** MRG § 16 Abs. 2: Abschläge in €/m² (≤ 0). NULL = nicht erfasst. */
+  abschlaege: numeric("abschlaege", { precision: 8, scale: 2 }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -390,6 +392,17 @@ export const monthlyInvoices = pgTable("monthly_invoices", {
   paidAmount: numeric("paid_amount", { precision: 10, scale: 2 }),
   /** WEG §31: Monatlicher Rücklagenbeitrag — separat ausgewiesen (Migration: 20260828_monthly_invoices_ruecklage.sql). */
   ruecklage: numeric("ruecklage", { precision: 12, scale: 2 }).default('0'),
+  /**
+   * Aktueller Mahnstatus (Migration: 20260818_monthly_invoices_mahnstufe.sql).
+   * 0 = offen, 1 = Zahlungserinnerung, 2 = 1. Mahnung, 3 = 2. Mahnung/letzte Mahnung.
+   * Ohne diese Spalte wurde der Wert von Drizzle ORM still verworfen — Eskalationen
+   * bauten nicht aufeinander auf.
+   */
+  mahnstufe: integer("mahnstufe").notNull().default(0),
+  /** Zeitpunkt des Versands der Zahlungserinnerung (Stufe 1). */
+  zahlungserinnerungAm: timestamp("zahlungserinnerung_am", { withTimezone: true }),
+  /** Zeitpunkt des Versands der letzten formellen Mahnung (Stufe ≥ 2). */
+  mahnungAm: timestamp("mahnung_am", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [

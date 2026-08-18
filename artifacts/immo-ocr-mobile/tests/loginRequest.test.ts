@@ -7,6 +7,9 @@
  *     the AbortController signal is NOT aborted after the promise resolves
  *  3. Non-OK HTTP response → throws server error message
  *  4. requires2FA flag → throws 2FA message
+ *  5. 401 Ungültige Anmeldedaten → throws user-visible German message
+ *  6. 401 "token expired" (server reports expiry) → throws with server message, not generic fallback
+ *  7. Failed login does NOT return a token (loginRequest throws, caller must not store anything)
  */
 
 import { describe, it } from 'node:test';
@@ -183,6 +186,73 @@ describe('loginRequest', () => {
         return true;
       },
     );
+  });
+
+  // ── Task #195: expired / invalid token scenarios ───────────────────────────
+
+  it('[Task #195] 401 Ungültige Anmeldedaten → throws user-visible German error, not generic fallback', async () => {
+    // This is the primary "bad credentials / expired session" path the user sees.
+    // The server returns 401 + a German-language error body.
+    await assert.rejects(
+      () => loginRequest(
+        'https://example.com/api/auth/login',
+        'user@example.com',
+        'wrong-password',
+        { fetchFn: makeErrorFetch(401, { error: 'Ungültige Anmeldedaten' }) },
+      ),
+      (err: Error) => {
+        assert.match(
+          err.message,
+          /Ungültige Anmeldedaten/,
+          'Server error message must be surfaced verbatim for user visibility',
+        );
+        return true;
+      },
+    );
+  });
+
+  it('[Task #195] 401 with token-expired message → throws server message, not generic fallback', async () => {
+    // Some server implementations return a specific code/message for expired tokens.
+    // loginRequest must pass it through so the UI can display it clearly.
+    const serverMsg = 'Token abgelaufen – bitte erneut anmelden';
+    await assert.rejects(
+      () => loginRequest(
+        'https://example.com/api/auth/login',
+        'user@example.com',
+        'any-password',
+        { fetchFn: makeErrorFetch(401, { error: serverMsg }) },
+      ),
+      (err: Error) => {
+        assert.equal(
+          err.message,
+          serverMsg,
+          'Expired-token server message must reach the UI intact, not be swallowed by a generic fallback',
+        );
+        return true;
+      },
+    );
+  });
+
+  it('[Task #195] failed login (401) does not return a token — loginRequest throws, caller must not store anything', async () => {
+    // Verify the contract: loginRequest THROWS on 401, never resolves with a partial result.
+    // This guarantees that AuthContext.login() cannot accidentally store an invalid token.
+    let resolved: boolean = false;
+    let thrown:   boolean = false;
+
+    try {
+      await loginRequest(
+        'https://example.com/api/auth/login',
+        'bad@user.com',
+        'wrong-password',
+        { fetchFn: makeErrorFetch(401, { error: 'Ungültige Anmeldedaten' }) },
+      );
+      resolved = true;
+    } catch {
+      thrown = true;
+    }
+
+    assert.equal(resolved, false, 'loginRequest must not resolve on 401 — an invalid token must never be returned');
+    assert.equal(thrown,   true,  'loginRequest must throw on 401 so the caller knows not to store anything');
   });
 
 });

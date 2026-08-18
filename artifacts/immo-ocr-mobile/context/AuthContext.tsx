@@ -6,6 +6,12 @@ import { flushCorrections } from '@/utils/flushCorrections';
 import { createRaceSafeLoader } from '@/utils/raceSafeCountLoader';
 import { apiRequest as _apiRequest } from '@/utils/apiRequest';
 import { loginRequest } from '@/utils/loginRequest';
+import {
+  saveAuthCredentials,
+  clearAuthCredentials,
+  loadAuthCredentials,
+} from '@/utils/authStorage';
+import { validateStoredToken } from '@/utils/validateStoredToken';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,8 +73,7 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
-const TOKEN_KEY = 'immo_ocr_token';
-const USER_KEY  = 'immo_ocr_user';
+// TOKEN_KEY and USER_KEY are now exported from @/utils/authStorage.
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token,        setToken]        = useState<string | null>(null);
@@ -115,16 +120,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     (async () => {
       try {
-        const [storedToken, storedUser] = await Promise.all([
-          SecureStore.getItemAsync(TOKEN_KEY),
-          SecureStore.getItemAsync(USER_KEY),
-        ]);
-        if (storedToken && storedUser) {
-          const parsedUser = JSON.parse(storedUser) as AuthUser;
-          setToken(storedToken);
-          setUser(parsedUser);
+        // Task #195: Validate the stored token against the server before entering
+        // the logged-in state. A 401 response clears SecureStore immediately so
+        // an expired or forged token can never re-activate a session on restart.
+        // Network errors are treated as "offline" — the token is kept.
+        const validateUrl = `https://${apiDomain}/api/auth/validate`;
+        const result = await validateStoredToken(SecureStore, fetch, validateUrl);
+        if (result.valid && result.token && result.user) {
+          setToken(result.token);
+          setUser(result.user as AuthUser);
           // Load pending count immediately so the badge appears before flush completes.
-          countLoaderRef.current.load(parsedUser.id);
+          countLoaderRef.current.load(result.user.id);
         }
       } catch {
         // ignore — treat as logged out
@@ -132,6 +138,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setIsLoading(false);
       }
     })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-flush queued corrections when a valid session is available.
@@ -154,12 +161,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Task #195: Shared handler for an expired/forged token detected mid-session.
+  // Called by apiRequest and flushPendingCorrections when the server returns 401.
+  // Mirrors logout() but without the full user-initiated teardown (no navigation).
+  async function handleUnauthorized(): Promise<void> {
+    await clearAuthCredentials(SecureStore);
+    countLoaderRef.current.invalidate();
+    setToken(null);
+    setUser(null);
+    setCurrentScan(null);
+    setPendingCount(0);
+  }
+
   async function apiRequest(
     path: string,
     options: RequestInit = {},
     timeoutMs = 30_000,
   ): Promise<Response> {
-    return _apiRequest(apiDomain, token, path, options, timeoutMs);
+    return _apiRequest(apiDomain, token, path, options, timeoutMs, handleUnauthorized);
   }
 
   async function login(email: string, password: string): Promise<void> {
@@ -171,10 +190,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       fullName:       data.fullName,
       organizationId: data.organizationId,
     };
-    await Promise.all([
-      SecureStore.setItemAsync(TOKEN_KEY, data.token),
-      SecureStore.setItemAsync(USER_KEY,  JSON.stringify(newUser)),
-    ]);
+    await saveAuthCredentials(SecureStore, data.token, newUser);
     // Discard any in-flight reads from a prior session before starting the
     // new one — protects against same-account re-login stale reads.
     countLoaderRef.current.invalidate();
@@ -204,6 +220,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         apiDomain,
         queue:     correctionQueue,
         fetchFn:   fetch,
+        onUnauthorized: handleUnauthorized,
       });
       // Refresh badge after each flush attempt so it reflects the current queue.
       countLoaderRef.current.load(currentUserId);
@@ -214,10 +231,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   async function logout(): Promise<void> {
-    await Promise.all([
-      SecureStore.deleteItemAsync(TOKEN_KEY),
-      SecureStore.deleteItemAsync(USER_KEY),
-    ]);
+    await clearAuthCredentials(SecureStore);
     // Discard any in-flight count reads before clearing state.
     countLoaderRef.current.invalidate();
     setToken(null);

@@ -165,7 +165,12 @@ router.get("/api/tenants/:id", isAuthenticated, async (req: any, res) => {
     // Merge active lease's MRG befristung fields into tenant response
     // so the frontend form can pre-fill befristet / befristungEnde
     const [activeLease] = await db
-      .select({ befristet: schema.leases.befristet, befristungEnde: schema.leases.befristungEnde })
+      .select({
+        befristet:    schema.leases.befristet,
+        befristungEnde: schema.leases.befristungEnde,
+        lagezuschlag: schema.leases.lagezuschlag,
+        abschlaege:   schema.leases.abschlaege,
+      })
       .from(schema.leases)
       .where(
         and(
@@ -177,8 +182,10 @@ router.get("/api/tenants/:id", isAuthenticated, async (req: any, res) => {
 
     const enriched = {
       ...tenant,
-      befristet: activeLease?.befristet ?? false,
+      befristet:    activeLease?.befristet ?? false,
       befristungEnde: activeLease?.befristungEnde ?? null,
+      lagezuschlag: activeLease?.lagezuschlag ?? null,
+      abschlaege:   activeLease?.abschlaege ?? null,
     };
 
     const roles = await getUserRoles(req);
@@ -203,6 +210,20 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
       }
     }
     const body = snakeToCamel(req.body);
+
+    // ── Validate MRG €/m² fields (§ 16 Abs. 2 MRG) ─────────────────────────
+    if (body.lagezuschlag !== undefined && body.lagezuschlag !== null && body.lagezuschlag !== '') {
+      const val = Number(body.lagezuschlag);
+      if (isNaN(val) || val < 0) {
+        return res.status(400).json({ error: 'lagezuschlag muss ≥ 0 sein (€/m², § 16 Abs. 2 MRG)' });
+      }
+    }
+    if (body.abschlaege !== undefined && body.abschlaege !== null && body.abschlaege !== '') {
+      const val = Number(body.abschlaege);
+      if (isNaN(val) || val > 0) {
+        return res.status(400).json({ error: 'abschlaege muss ≤ 0 sein (€/m², § 16 Abs. 2 MRG)' });
+      }
+    }
 
     // Load existing active lease BEFORE the transaction so we can derive
     // effective befristet/befristungEnde for partial updates (e.g. only
@@ -275,7 +296,15 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
 
     // Everything below is one atomic DB transaction — tenant + lease must
     // succeed or fail together so befristung data is never half-written.
-    await db.transaction(async (tx) => {
+    //
+    // Re-fetches happen INSIDE the transaction (using tx) so that:
+    //  a) They are guaranteed to see their own writes (read-your-writes semantics)
+    //  b) They remain valid even when the outer connection already has a
+    //     transaction-local GUC (app.current_org set via rlsMiddleware):
+    //     issuing COMMIT via db.transaction() on such a connection commits the
+    //     outer transaction and clears is_local GUCs, making a post-COMMIT db.select()
+    //     run without RLS context and return 0 rows.
+    const { finalTenant, finalLease } = await db.transaction(async (tx) => {
       await tx
         .update(schema.tenants)
         .set({ ...validationResult.data, updatedAt: new Date() })
@@ -285,8 +314,10 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
       const leaseBefristungTouched =
         body.befristet !== undefined || body.befristungEnde !== undefined;
 
+      const mrgFieldsTouched = body.lagezuschlag !== undefined || body.abschlaege !== undefined;
+
       const leasePayload: Record<string, unknown> = {};
-      if (leaseBefristungTouched || body.grundmiete !== undefined) {
+      if (leaseBefristungTouched || body.grundmiete !== undefined || mrgFieldsTouched) {
         // Always sync befristung state to the lease when touched
         if (leaseBefristungTouched) {
           leasePayload.befristet    = effectiveBefristet;
@@ -294,9 +325,21 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
           leasePayload.endDate      = effectiveBefristet ? effectiveBefristungEnde : null;
         }
         // Sync financial fields to lease when sent
-        const leaseFinancialFields: Array<keyof typeof schema.InsertLease> = [];
         for (const f of ['grundmiete', 'betriebskostenVorschuss', 'heizkostenVorschuss', 'wasserkostenVorschuss', 'kaution', 'kautionBezahlt'] as const) {
           if (body[f] !== undefined) (leasePayload as any)[f] = (validationResult.data as any)[f];
+        }
+        // Sync MRG surcharge/discount fields (§ 16 Abs. 2 MRG) to lease
+        if (body.lagezuschlag !== undefined) {
+          leasePayload.lagezuschlag =
+            body.lagezuschlag === null || body.lagezuschlag === ''
+              ? null
+              : String(Number(body.lagezuschlag));
+        }
+        if (body.abschlaege !== undefined) {
+          leasePayload.abschlaege =
+            body.abschlaege === null || body.abschlaege === ''
+              ? null
+              : String(Number(body.abschlaege));
         }
         leasePayload.updatedAt = new Date();
 
@@ -305,7 +348,7 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
             .update(schema.leases)
             .set(leasePayload)
             .where(eq(schema.leases.id, existingLease.id));
-        } else if (leaseBefristungTouched) {
+        } else if (leaseBefristungTouched || mrgFieldsTouched) {
           // No active lease yet — create one now (NOT non-fatal: must succeed)
           const startDate = (validationResult.data as any).mietbeginn
             || tenant.mietbeginn
@@ -324,35 +367,47 @@ router.patch("/api/tenants/:id", isAuthenticated, requireRole("property_manager"
             status: 'aktiv',
             befristet: effectiveBefristet,
             befristungEnde: effectiveBefristungEnde,
+            lagezuschlag: leasePayload.lagezuschlag !== undefined ? leasePayload.lagezuschlag : null,
+            abschlaege:   leasePayload.abschlaege   !== undefined ? leasePayload.abschlaege   : null,
           };
           await tx.insert(schema.leases).values(newLease);
         }
       }
-    });
 
-    // Re-fetch final state (both tenant + lease) after the committed transaction
-    const [finalTenant] = await db
-      .select()
-      .from(schema.tenants)
-      .where(eq(schema.tenants.id, req.params.id))
-      .limit(1);
+      // Re-fetch final state inside the transaction — guarantees read-your-writes
+      // and avoids the post-COMMIT GUC reset described above.
+      const [finalTenant] = await tx
+        .select()
+        .from(schema.tenants)
+        .where(eq(schema.tenants.id, req.params.id))
+        .limit(1);
 
-    const [finalLease] = await db
-      .select({ befristet: schema.leases.befristet, befristungEnde: schema.leases.befristungEnde })
-      .from(schema.leases)
-      .where(
-        and(
-          eq(schema.leases.tenantId, req.params.id),
-          eq(schema.leases.status, 'aktiv')
+      const [finalLease] = await tx
+        .select({
+          befristet:      schema.leases.befristet,
+          befristungEnde: schema.leases.befristungEnde,
+          lagezuschlag:   schema.leases.lagezuschlag,
+          abschlaege:     schema.leases.abschlaege,
+        })
+        .from(schema.leases)
+        .where(
+          and(
+            eq(schema.leases.tenantId, req.params.id),
+            eq(schema.leases.status, 'aktiv')
+          )
         )
-      )
-      .limit(1);
+        .limit(1);
+
+      return { finalTenant, finalLease };
+    });
 
     const roles = await getUserRoles(req);
     const enriched = {
       ...decryptIbanFields(finalTenant),
-      befristet:     finalLease?.befristet ?? false,
+      befristet:    finalLease?.befristet ?? false,
       befristungEnde: finalLease?.befristungEnde ?? null,
+      lagezuschlag: finalLease?.lagezuschlag ?? null,
+      abschlaege:   finalLease?.abschlaege ?? null,
     };
     res.json(isTester(roles) ? maskPersonalData(enriched) : enriched);
   } catch (error) {
@@ -431,6 +486,21 @@ router.post("/api/tenants", isAuthenticated, requireRole("property_manager"), as
       });
     }
     
+    // ── Validate MRG percentage fields (§ 16 Abs. 2 MRG) ────────────────────
+    // ── Validate MRG €/m² fields (§ 16 Abs. 2 MRG) ─────────────────────────
+    if (body.lagezuschlag !== undefined && body.lagezuschlag !== null && body.lagezuschlag !== '') {
+      const val = Number(body.lagezuschlag);
+      if (isNaN(val) || val < 0) {
+        return res.status(400).json({ error: 'lagezuschlag muss ≥ 0 sein (€/m², § 16 Abs. 2 MRG)' });
+      }
+    }
+    if (body.abschlaege !== undefined && body.abschlaege !== null && body.abschlaege !== '') {
+      const val = Number(body.abschlaege);
+      if (isNaN(val) || val > 0) {
+        return res.status(400).json({ error: 'abschlaege muss ≤ 0 sein (€/m², § 16 Abs. 2 MRG)' });
+      }
+    }
+
     const befristet = Boolean(body.befristet);
     const befristungEnde: string | null = befristet ? (body.befristungEnde || null) : null;
     const startDate: string = body.mietbeginn || new Date().toISOString().slice(0, 10);
@@ -446,6 +516,16 @@ router.post("/api/tenants", isAuthenticated, requireRole("property_manager"), as
       bic: encryptField(validationResult.data.bic ?? null),
     };
 
+    // Parse MRG surcharge/discount for the new lease (null = not set)
+    const postLagezuschlag: string | null =
+      body.lagezuschlag !== undefined && body.lagezuschlag !== null && body.lagezuschlag !== ''
+        ? String(Number(body.lagezuschlag))
+        : null;
+    const postAbschlaege: string | null =
+      body.abschlaege !== undefined && body.abschlaege !== null && body.abschlaege !== ''
+        ? String(Number(body.abschlaege))
+        : null;
+
     const leaseData: schema.InsertLease = {
       tenantId: '', // filled inside transaction
       unitId: body.unitId,
@@ -460,6 +540,8 @@ router.post("/api/tenants", isAuthenticated, requireRole("property_manager"), as
       status: 'aktiv',
       befristet,
       befristungEnde,
+      lagezuschlag: postLagezuschlag,
+      abschlaege:   postAbschlaege,
     };
 
     // Tenant insert + lease insert are one atomic transaction.
@@ -471,7 +553,13 @@ router.post("/api/tenants", isAuthenticated, requireRole("property_manager"), as
       await tx.insert(schema.leases).values({ ...leaseData, tenantId: t.id });
     });
 
-    res.json({ ...createdTenant!, befristet, befristungEnde });
+    res.json({
+      ...createdTenant!,
+      befristet,
+      befristungEnde,
+      lagezuschlag: postLagezuschlag,
+      abschlaege:   postAbschlaege,
+    });
   } catch (error) {
     console.error("Create tenant error:", error);
     res.status(500).json({ error: "Mieter konnte nicht erstellt werden" });

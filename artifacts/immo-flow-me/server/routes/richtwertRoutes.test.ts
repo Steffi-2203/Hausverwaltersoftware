@@ -358,41 +358,44 @@ describe('GET /api/tenants/:id/mrg-check — Bundesland & Befristung (state-tran
     expect(res.body.zulassigerHmz).toBeCloseTo(500.25, 1);
   });
 
-  test('[G2] Lagezuschlag 10 % gespeichert: HMZ steigt auf 550,28 → nicht mehr überschritten', async () => {
+  test('[G2] Lagezuschlag 0,50 €/m² gespeichert: HMZ steigt auf 537,75 → nicht mehr überschritten', async () => {
+    // Neue Formel (§ 16 Abs. 2 MRG): HMZ = (Richtwert + Lagezuschlag_€/m² + Abschläge_€/m²) × m²
+    // (6,67 + 0,50) × 75 = 537,75 > Grundmiete 520 → nicht überschritten
     await rootDb.execute(sql`
-      UPDATE leases SET lagezuschlag = 10 WHERE id = ${leaseZuschlag}::uuid
+      UPDATE leases SET lagezuschlag = 0.50 WHERE id = ${leaseZuschlag}::uuid
     `);
     const res = await request(authApp).get(`/api/tenants/${tenantZuschlag}/mrg-check`);
     expect(res.status).toBe(200);
     expect(res.body.ueberschritten).toBe(false);
-    expect(res.body.zulassigerHmz).toBeCloseTo(550.28, 1); // 500,25 × 1,10
+    expect(res.body.zulassigerHmz).toBeCloseTo(537.75, 1);
   });
 
-  test('[G3] Abschläge -20 % zusätzlich gespeichert: HMZ sinkt auf 450,23 → wieder überschritten', async () => {
+  test('[G3] Abschläge -0,50 €/m² zusätzlich gespeichert: HMZ sinkt auf 500,25 → wieder überschritten', async () => {
+    // (6,67 + 0,50 − 0,50) × 75 = 6,67 × 75 = 500,25 < Grundmiete 520 → überschritten
     await rootDb.execute(sql`
-      UPDATE leases SET abschlaege = -20 WHERE id = ${leaseZuschlag}::uuid
+      UPDATE leases SET abschlaege = -0.50 WHERE id = ${leaseZuschlag}::uuid
     `);
     const res = await request(authApp).get(`/api/tenants/${tenantZuschlag}/mrg-check`);
     expect(res.status).toBe(200);
     expect(res.body.ueberschritten).toBe(true);
-    expect(res.body.zulassigerHmz).toBeCloseTo(450.23, 1); // 500,25 × (1 + (10-20)/100)
+    expect(res.body.zulassigerHmz).toBeCloseTo(500.25, 1);
   });
 
   test('[G4] DB-Constraints: negativer Lagezuschlag und positive Abschläge werden abgelehnt', async () => {
     // Drizzle verpackt den PG-Fehler; Constraint-Name steckt in error.cause.
     await expect(rootDb.execute(sql`
-      UPDATE leases SET lagezuschlag = -5 WHERE id = ${leaseZuschlag}::uuid
+      UPDATE leases SET lagezuschlag = -0.10 WHERE id = ${leaseZuschlag}::uuid
     `)).rejects.toThrow();
     await expect(rootDb.execute(sql`
-      UPDATE leases SET abschlaege = 15 WHERE id = ${leaseZuschlag}::uuid
+      UPDATE leases SET abschlaege = 0.10 WHERE id = ${leaseZuschlag}::uuid
     `)).rejects.toThrow();
-    // Werte unverändert (10 / -20 aus G2/G3)
+    // Werte unverändert (0,50 / -0,50 aus G2/G3)
     const rowRes = await rootDb.execute(sql`
       SELECT lagezuschlag, abschlaege FROM leases WHERE id = ${leaseZuschlag}::uuid
     `);
     const r = rowRes.rows[0] as any;
-    expect(Number(r.lagezuschlag)).toBe(10);
-    expect(Number(r.abschlaege)).toBe(-20);
+    expect(Number(r.lagezuschlag)).toBeCloseTo(0.50, 2);
+    expect(Number(r.abschlaege)).toBeCloseTo(-0.50, 2);
   });
 
   // ── Scenario D & E: Suppression ────────────────────────────────────────────

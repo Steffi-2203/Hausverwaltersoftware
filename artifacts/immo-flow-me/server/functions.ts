@@ -282,17 +282,19 @@ export function registerFunctionRoutes(app: Express) {
         html: htmlContent,
       });
 
-      const updateData: Record<string, any> = { mahnstufe: dunningLevel };
-      if (dunningLevel === 1) {
-        updateData.zahlungserinnerungAm = new Date().toISOString();
-      } else {
-        updateData.mahnungAm = new Date().toISOString();
-      }
+      // Typsicheres Update — Record<string,any> würde von Drizzle still ignoriert,
+      // wenn die Spalten nicht im Schema stehen (Befund: mahnstufe wurde verworfen).
+      const now = new Date();
+      const dunningUpdate: Partial<typeof monthlyInvoices.$inferInsert> = {
+        mahnstufe: dunningLevel,
+        zahlungserinnerungAm: dunningLevel === 1 ? now : undefined,
+        mahnungAm: dunningLevel > 1 ? now : undefined,
+      };
 
       // monthly_invoices hat keine organization_id — kanonische Kette wie im
       // RLS-Modell: invoice.unit_id → unit → property. Fremde invoiceId trifft 0 Zeilen.
       await db.update(monthlyInvoices)
-        .set(updateData)
+        .set(dunningUpdate)
         .where(and(
           eq(monthlyInvoices.id, invoiceId),
           inArray(

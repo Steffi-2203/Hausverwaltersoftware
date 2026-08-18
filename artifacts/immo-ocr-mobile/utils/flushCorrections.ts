@@ -27,6 +27,11 @@ export interface FlushDeps {
   queue:     QueueHandle;
   fetchFn:   FetchLike;
   timeoutMs?: number;
+  /**
+   * Called when the server rejects the token with 401.
+   * AuthContext uses this to clear SecureStore + React state atomically.
+   */
+  onUnauthorized?: () => void | Promise<void>;
 }
 
 export async function flushCorrections({
@@ -36,6 +41,7 @@ export async function flushCorrections({
   queue,
   fetchFn,
   timeoutMs = 15_000,
+  onUnauthorized,
 }: FlushDeps): Promise<number> {
   const items = await queue.getForUser(userId);
   if (items.length === 0) return 0;
@@ -68,7 +74,11 @@ export async function flushCorrections({
       }
 
       // Token expired — stop immediately; no point burning through the queue.
-      if (res.status === 401) break;
+      // Notify the caller so it can clear SecureStore + React state atomically.
+      if (res.status === 401) {
+        if (onUnauthorized) void Promise.resolve(onUnauthorized());
+        break;
+      }
 
       // Server temporarily unavailable (e.g. DB outage) — stop and retry on
       // the next foreground event or cold start.
