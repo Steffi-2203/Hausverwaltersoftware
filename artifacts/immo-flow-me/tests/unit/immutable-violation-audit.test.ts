@@ -7,6 +7,7 @@
  */
 
 import { describe, it, before, after } from 'node:test';
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 import assert from 'node:assert/strict';
 import { rootDb as db, appDb, appPool, withOrgContext, activeDb } from '../../server/db';
 import {
@@ -36,6 +37,11 @@ async function violationEntries(tableName: string) {
   `);
   return r.rows as Array<{ id: string; table_name: string; action: string; details: any }>;
 }
+
+// Serialisierung: audit_logs ist global (kein org-Scope) — Advisory Lock verhindert
+// Interferenzen mit anderen Testdateien, die gleichzeitig Audit-Einträge schreiben.
+before(async () => { await acquireAuditLogTestLock(); });
+after(async () => { await releaseAuditLogTestLock(); });
 
 describe('Immutability-Trigger-Verletzungen im Audit-Log', () => {
   before(async () => {

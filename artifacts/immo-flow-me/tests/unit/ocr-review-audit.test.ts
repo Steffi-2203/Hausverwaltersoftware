@@ -11,6 +11,7 @@
  */
 import { describe, test, before as beforeAll, after as afterAll } from 'node:test';
 import { vi, expect } from '../helpers/expect';
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 
 import express, { Request, Response, NextFunction } from 'express';
 import request from 'supertest';
@@ -70,8 +71,8 @@ async function cleanup() {
 const authApp = buildApp();
 const anonApp = buildApp(null);
 
-beforeAll(async () => { await setupTestDb(); await seed(); });
-afterAll(async () => { await cleanup(); await teardownTestDb(); });
+beforeAll(async () => { await acquireAuditLogTestLock(); await setupTestDb(); await seed(); });
+afterAll(async () => { try { await cleanup(); await teardownTestDb(); } finally { await releaseAuditLogTestLock(); } });
 
 // ── needs_review-Logik als Unit-Test ─────────────────────────────────────────
 

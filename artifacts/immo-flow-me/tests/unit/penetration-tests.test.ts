@@ -1,4 +1,5 @@
 import { describe, test, before as beforeAll, after as afterAll } from 'node:test';
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 import { expect } from '../helpers/expect';
 import { db } from '../../server/db';
 import { sql, eq } from 'drizzle-orm';
@@ -91,6 +92,11 @@ async function cleanupPenTestData() {
     console.warn('Cleanup warning:', err);
   }
 }
+
+// Serialisierung: audit_logs ist global (kein org-Scope) — Advisory Lock verhindert
+// Interferenzen mit anderen Testdateien, die gleichzeitig Audit-Einträge schreiben.
+beforeAll(async () => { await acquireAuditLogTestLock(); });
+afterAll(async () => { await releaseAuditLogTestLock(); });
 
 describe('Penetration Test Suite', () => {
   beforeAll(async () => {

@@ -7,5 +7,5 @@
 - [GitHub-Backup per API-Push](github-backup-push.md) — git push authentifiziert nicht; Backup via Connector-Octokit: Repo-Init, gedrosselte Blobs, Tree in 150er-Chunks
 - [rootDb vs db service pattern](rootdb-service-pattern.md) — which service functions must use rootDb and why; VPI reference checks must be cross-org
 - [Post-merge: kein drizzle push](post-merge-db-push.md) — lib/db-Push auf der Shared-DB würde App-Tabellen droppen; Boot-Migrationen reichen
-- [Global-table test races](global-table-test-races.md) — Tests auf globalen Tabellen (vpi_values) racen zwischen parallelen Testprozessen; via pg advisory lock (vpiTestLock.ts) serialisieren
+- [Global-table test races](global-table-test-races.md) — Tests auf globalen Tabellen (vpi_values, audit_logs) racen zwischen parallelen Testprozessen; via pg advisory lock (vpiTestLock.ts / auditLogTestLock.ts) serialisieren
 - [Test-Seed-Muster: eindeutige E-Mails](test-seed-unique-emails.md) — fixe E-Mail + zufällige Profil-ID pro Lauf = ON-CONFLICT-Skip + user_roles-FK-Fehler nach abgebrochenen Läufen; E-Mails pro Lauf eindeutig machen

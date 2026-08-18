@@ -14,6 +14,7 @@
  *   node --import=./node_modules/tsx/dist/esm/index.cjs --test tests/unit/api-key-management.test.ts
  */
 import { describe, test, before, after } from 'node:test';
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 import assert from 'node:assert/strict';
 import express, { Request, Response, NextFunction } from 'express';
 import request from 'supertest';
@@ -98,8 +99,8 @@ function buildReadonlyApp() {
   return app;
 }
 
-before(async () => { await seed(); });
-after(async () => { await cleanup(); });
+before(async () => { await acquireAuditLogTestLock(); await seed(); });
+after(async () => { try { await cleanup(); } finally { await releaseAuditLogTestLock(); } });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('API-Key Status Endpoint', () => {

@@ -1,4 +1,5 @@
 import { describe, test, before as beforeAll, after as afterAll } from 'node:test';
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from '../helpers/auditLogTestLock';
 import { expect } from '../helpers/expect';
 import { billingService } from '../../server/services/billing.service';
 import { exportTenantData, anonymizeTenantData } from '../../server/services/gdprService';
@@ -73,6 +74,11 @@ async function cleanupIsolationData() {
   await db.execute(sql`DELETE FROM profiles WHERE id IN (${userAId}::uuid, ${userBId}::uuid)`);
   await db.execute(sql`DELETE FROM organizations WHERE id IN (${orgAId}::uuid, ${orgBId}::uuid)`);
 }
+
+// Serialisierung: audit_logs ist global (kein org-Scope) — Advisory Lock verhindert
+// Interferenzen mit anderen Testdateien, die gleichzeitig Audit-Einträge schreiben.
+beforeAll(async () => { await acquireAuditLogTestLock(); });
+afterAll(async () => { await releaseAuditLogTestLock(); });
 
 describe('Cross-Tenant Isolation & Authorization', () => {
   beforeAll(async () => {

@@ -24,6 +24,7 @@
  */
 
 import { test, describe, before, after } from "node:test";
+import { acquireAuditLogTestLock, releaseAuditLogTestLock } from "../helpers/auditLogTestLock";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { Pool } from "pg";
@@ -95,6 +96,11 @@ function localHmac(entry: HmacEntry): string {
   ].join("|");
   return crypto.createHmac("sha256", AUDIT_HMAC_KEY).update(message).digest("hex");
 }
+
+// Serialisierung: audit_logs ist global (kein org-Scope) — Advisory Lock verhindert
+// Interferenzen mit anderen Testdateien, die gleichzeitig Audit-Einträge schreiben.
+// Lock wird in before() geholt und im after() wieder freigegeben.
+before(async () => { await acquireAuditLogTestLock(); });
 
 // Tables written by this run — cleaned up in after().
 const createdTables = new Set<string>();
@@ -479,6 +485,10 @@ describe("PUNKT 6: audit_logs HMAC-Integritätskette", () => {
 });
 
 after(async () => {
-  await cleanup();
-  await pool.end();
+  try {
+    await cleanup();
+    await pool.end();
+  } finally {
+    await releaseAuditLogTestLock();
+  }
 });
