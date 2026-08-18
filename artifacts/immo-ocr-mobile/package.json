@@ -8,7 +8,7 @@
     "build": "node scripts/build.js",
     "serve": "node server/serve.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test tests/pendingCorrections.test.ts tests/gallery.test.ts tests/fetchWithTimeout.test.ts tests/loginRequest.test.ts tests/scanActions.test.ts"
+    "test": "tsx --test tests/pendingCorrections.test.ts tests/gallery.test.ts tests/fetchWithTimeout.test.ts tests/loginRequest.test.ts tests/scanActions.test.ts tests/ocrTimeout.test.ts"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

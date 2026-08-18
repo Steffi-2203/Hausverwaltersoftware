@@ -16,6 +16,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as Haptics from 'expo-haptics';
 import { Feather, Ionicons } from '@expo/vector-icons';
 import { useAuth, type ScanResult } from '@/context/AuthContext';
+import { handleOcrError } from '@/utils/ocrError';
 import { handleDataUrl, validateWebFileSize } from '@/utils/galleryUtils';
 import { openGallery as _openGallery, openCamera as _openCamera } from '@/utils/scanActions';
 import type { NativeDeps } from '@/utils/galleryUtils';
@@ -153,11 +154,7 @@ export default function ScanScreen() {
       router.push('/review');
     } catch (err: any) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-      Alert.alert(
-        'OCR fehlgeschlagen',
-        err?.message ?? 'Die Rechnung konnte nicht analysiert werden. Bitte erneut versuchen.',
-        [{ text: 'OK' }]
-      );
+      handleOcrError(err, (title, message, buttons) => Alert.alert(title, message, buttons));
     } finally {
       setScanning(false);
       setScanLabel('');

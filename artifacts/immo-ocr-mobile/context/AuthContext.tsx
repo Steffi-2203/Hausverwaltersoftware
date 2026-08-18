@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import * as SecureStore from 'expo-secure-store';
 import { correctionQueue } from '@/utils/pendingCorrections';
-import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+import { apiRequest as _apiRequest } from '@/utils/apiRequest';
 import { loginRequest } from '@/utils/loginRequest';
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -104,13 +104,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     options: RequestInit = {},
     timeoutMs = 30_000,
   ): Promise<Response> {
-    const url = `https://${apiDomain}${path}`;
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string> ?? {}),
-    };
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    return fetchWithTimeout(url, { ...options, headers }, timeoutMs);
+    return _apiRequest(apiDomain, token, path, options, timeoutMs);
   }
 
   async function login(email: string, password: string): Promise<void> {
