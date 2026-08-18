@@ -461,7 +461,12 @@ router.get("/api/accounting/export/op-liste", isAuthenticated, async (req: Reque
     }));
 
     const orgName = (req as any).session?.organizationName || "Organisation";
-    const buffer = exportOPListe([...items, ...wegItems], orgName);
+    const combined = [...items, ...wegItems].sort((a, b) => {
+      const dateA = (a.faelligAm ?? a.faellig_am ?? '') as string;
+      const dateB = (b.faelligAm ?? b.faellig_am ?? '') as string;
+      return dateB.localeCompare(dateA); // descending: neueste Fälligkeit zuerst
+    });
+    const buffer = exportOPListe(combined, orgName);
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="OP-Liste_${new Date().getFullYear()}.xlsx"`);
