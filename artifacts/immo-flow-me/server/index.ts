@@ -12,7 +12,7 @@ import { registerRoutes } from "./routes";
 // Dieser Import bleibt als Belt-and-Suspenders und ist ein No-Op wenn
 // immutableViolationAudit.ts bereits via db.ts geladen wurde.
 import "./lib/immutableViolationAudit";
-import { parseEncryptionKey } from "./lib/fieldEncryption";
+import { parseEncryptionKey, isKeyRotationActive } from "./lib/fieldEncryption";
 import { registerDsgvoRoutes } from "./routes/dsgvoRoutes";
 import { registerSecurityRoutes, trackSession } from "./routes/securityRoutes";
 import { registerTicketRoutes } from "./routes/ticketRoutes";
@@ -250,17 +250,32 @@ ${pages.map(p => `  <url>
 });
 
 app.get("/health", (_req, res) => {
-  res.status(200).json({ status: "ok", uptime: process.uptime() });
+  const rotationWindowOpen = isKeyRotationActive();
+  res.status(200).json({
+    status: "ok",
+    uptime: process.uptime(),
+    ...(rotationWindowOpen ? { keyRotationWindowOpen: true } : {}),
+  });
 });
 
 // Uptime-Monitoring-Endpunkt (extern angepingt, z. B. UptimeRobot):
 // prüft zusätzlich die Datenbank — 503 wenn die DB nicht erreichbar ist.
 app.get("/api/healthz", async (_req, res) => {
+  const rotationWindowOpen = isKeyRotationActive();
   try {
     await pool.query("SELECT 1");
-    res.status(200).json({ status: "ok", db: "ok", uptime: Math.round(process.uptime()) });
+    res.status(200).json({
+      status: "ok",
+      db: "ok",
+      uptime: Math.round(process.uptime()),
+      ...(rotationWindowOpen ? { keyRotationWindowOpen: true } : {}),
+    });
   } catch {
-    res.status(503).json({ status: "degraded", db: "unreachable" });
+    res.status(503).json({
+      status: "degraded",
+      db: "unreachable",
+      ...(rotationWindowOpen ? { keyRotationWindowOpen: true } : {}),
+    });
   }
 });
 

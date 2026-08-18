@@ -141,10 +141,22 @@ export async function migrateFieldEncryption(): Promise<void> {
           `FIELD_ENCRYPTION_KEY_OLD NICHT entfernen bis die Rotation sauber durchläuft.`,
         );
       }
-      logger.info(
-        `[fieldEncryption] Rotation abgeschlossen (${result.rotated} rotiert, ${result.encrypted} ` +
-        `neu verschlüsselt). FIELD_ENCRYPTION_KEY_OLD kann jetzt entfernt werden.`,
-      );
+      if (result.rotated === 0) {
+        // Nichts mehr umzuschlüsseln → Rotation war bereits vollständig abgeschlossen.
+        // Das Rotationsfenster (FIELD_ENCRYPTION_KEY_OLD) ist unnötig offen —
+        // ein kompromittierter Alt-Schlüssel bleibt solange nutzbar.
+        logger.warn(
+          "⚠️  [fieldEncryption] ROTATIONSFENSTER OFFEN: FIELD_ENCRYPTION_KEY_OLD ist gesetzt, " +
+          "aber es gibt keine Werte mehr, die umgeschlüsselt werden müssen. " +
+          "Die Rotation ist vollständig abgeschlossen — FIELD_ENCRYPTION_KEY_OLD sofort entfernen, " +
+          "um das Angriffsfenster durch den Alt-Schlüssel zu schließen.",
+        );
+      } else {
+        logger.info(
+          `[fieldEncryption] Rotation abgeschlossen (${result.rotated} rotiert, ${result.encrypted} ` +
+          `neu verschlüsselt). FIELD_ENCRYPTION_KEY_OLD kann jetzt entfernt werden.`,
+        );
+      }
     }
   }
 
