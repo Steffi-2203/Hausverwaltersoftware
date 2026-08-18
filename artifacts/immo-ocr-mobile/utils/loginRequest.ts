@@ -14,11 +14,24 @@ export interface LoginResponse {
 }
 
 export interface LoginRequestOptions {
-  /** Abort the request after this many milliseconds (default 10 000). */
+  /**
+   * Abort the request after this many milliseconds.
+   * Defaults to EXPO_PUBLIC_LOGIN_TIMEOUT_MS (env var) or 10 000 ms.
+   */
   timeoutMs?: number;
   /** Injectable fetch function; defaults to globalThis.fetch. */
   fetchFn?: typeof fetch;
 }
+
+/**
+ * Default login timeout in milliseconds.
+ * Reads EXPO_PUBLIC_LOGIN_TIMEOUT_MS at module load time; falls back to 10 000.
+ */
+const DEFAULT_LOGIN_TIMEOUT_MS = (() => {
+  const raw = process.env.EXPO_PUBLIC_LOGIN_TIMEOUT_MS;
+  const parsed = raw ? parseInt(raw, 10) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 10_000;
+})();
 
 /**
  * Perform a login POST request.
@@ -37,7 +50,7 @@ export async function loginRequest(
   opts:     LoginRequestOptions = {},
 ): Promise<LoginResponse> {
   const {
-    timeoutMs = 10_000,
+    timeoutMs = DEFAULT_LOGIN_TIMEOUT_MS,
     fetchFn   = globalThis.fetch,
   } = opts;
 

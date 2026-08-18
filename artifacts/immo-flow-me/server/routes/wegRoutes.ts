@@ -70,7 +70,18 @@ router.get("/api/weg/votes", async (req: Request, res: Response) => {
     if (!assemblyId) return res.status(400).json({ error: "assemblyId erforderlich" });
     const assembly = await db.select().from(schema.wegAssemblies).where(and(eq(schema.wegAssemblies.id, assemblyId), eq(schema.wegAssemblies.organizationId, ctx.orgId))).limit(1);
     if (!assembly.length) return res.status(404).json({ error: "Versammlung nicht gefunden" });
-    const data = await db.select().from(schema.wegVotes).where(eq(schema.wegVotes.assemblyId, assemblyId)).orderBy(schema.wegVotes.createdAt);
+    // LEFT JOIN auf weg_vote_results: invalidation_warning mitliefern, damit
+    // das Frontend Eigentümer sofort über einen invalidierten Umlaufbeschluss
+    // informieren kann (§ 24 Abs. 1 WEG 2002 — true→false Flip).
+    const data = await db
+      .select({
+        ...getTableColumns(schema.wegVotes),
+        invalidation_warning: schema.wegVoteResults.invalidationWarning,
+      })
+      .from(schema.wegVotes)
+      .leftJoin(schema.wegVoteResults, eq(schema.wegVotes.id, schema.wegVoteResults.voteId))
+      .where(eq(schema.wegVotes.assemblyId, assemblyId))
+      .orderBy(schema.wegVotes.createdAt);
     res.json(objectToSnakeCase(data));
   } catch (error) {
     console.error("Error fetching votes:", error);

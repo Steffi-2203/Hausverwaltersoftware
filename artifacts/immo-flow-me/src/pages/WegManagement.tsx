@@ -2391,27 +2391,39 @@ function VotesTab({ propertyId }: { propertyId: string }) {
           </TableHeader>
           <TableBody>
             {votes.map(v => (
-              <TableRow key={v.id} data-testid={`row-vote-${v.id}`}>
-                <TableCell>
-                  <span className="font-medium">{v.topic}</span>
-                  {v.description && <p className="text-xs text-muted-foreground mt-1">{v.description}</p>}
-                </TableCell>
-                <TableCell className="space-y-1">
-                  {v.vote_type === 'umlauf' && (
-                    <Badge variant="secondary" className="text-xs bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 mr-1" data-testid={`badge-umlauf-${v.id}`}>
-                      Umlauf §24 WEG
-                    </Badge>
-                  )}
-                  <Badge variant="outline" className="text-xs">{majorityLabels[v.required_majority] || v.required_majority}</Badge>
-                </TableCell>
-                <TableCell className="text-center text-green-600 dark:text-green-400">{v.votes_yes}</TableCell>
-                <TableCell className="text-center text-destructive">{v.votes_no}</TableCell>
-                <TableCell className="text-center text-muted-foreground">{v.votes_abstain}</TableCell>
-                <TableCell className="text-center text-green-600 dark:text-green-400">{fmtPct(v.mea_votes_yes)}</TableCell>
-                <TableCell className="text-center text-destructive">{fmtPct(v.mea_votes_no)}</TableCell>
-                <TableCell className="text-center text-muted-foreground">{fmtPct(v.mea_votes_abstain)}</TableCell>
-                <TableCell><ResultBadge result={v.result} /></TableCell>
-              </TableRow>
+              <>
+                <TableRow key={v.id} data-testid={`row-vote-${v.id}`}>
+                  <TableCell>
+                    <span className="font-medium">{v.topic}</span>
+                    {v.description && <p className="text-xs text-muted-foreground mt-1">{v.description}</p>}
+                  </TableCell>
+                  <TableCell className="space-y-1">
+                    {v.vote_type === 'umlauf' && (
+                      <Badge variant="secondary" className="text-xs bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 mr-1" data-testid={`badge-umlauf-${v.id}`}>
+                        Umlauf §24 WEG
+                      </Badge>
+                    )}
+                    <Badge variant="outline" className="text-xs">{majorityLabels[v.required_majority] || v.required_majority}</Badge>
+                  </TableCell>
+                  <TableCell className="text-center text-green-600 dark:text-green-400">{v.votes_yes}</TableCell>
+                  <TableCell className="text-center text-destructive">{v.votes_no}</TableCell>
+                  <TableCell className="text-center text-muted-foreground">{v.votes_abstain}</TableCell>
+                  <TableCell className="text-center text-green-600 dark:text-green-400">{fmtPct(v.mea_votes_yes)}</TableCell>
+                  <TableCell className="text-center text-destructive">{fmtPct(v.mea_votes_no)}</TableCell>
+                  <TableCell className="text-center text-muted-foreground">{fmtPct(v.mea_votes_abstain)}</TableCell>
+                  <TableCell><ResultBadge result={v.result} /></TableCell>
+                </TableRow>
+                {v.invalidation_warning && (
+                  <TableRow key={`warn-${v.id}`} data-testid={`row-invalidation-warning-${v.id}`}>
+                    <TableCell colSpan={9} className="py-2 px-4">
+                      <div className="flex items-start gap-2 rounded-md border border-red-300 bg-red-50 dark:bg-red-950/30 dark:border-red-700 px-3 py-2 text-sm text-red-800 dark:text-red-300">
+                        <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0 text-red-600 dark:text-red-400" />
+                        <span data-testid={`text-invalidation-warning-${v.id}`}>{v.invalidation_warning}</span>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </>
             ))}
           </TableBody>
         </Table>

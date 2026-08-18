@@ -70,6 +70,12 @@ export interface WegVote {
   /** § 24 Abs. 1 WEG 2002: 'umlauf' erfordert Einstimmigkeit aller Eigentümer. */
   vote_type: 'versammlung' | 'umlauf';
   created_at: string;
+  /**
+   * Gesetzt wenn ein Umlaufbeschluss von passed=true auf passed=false gekippt ist
+   * (§ 24 Abs. 1 WEG 2002 — nachträgliche Nein-Stimme oder Enthaltung).
+   * Das Frontend zeigt diesen Text als roten Warnbanner an.
+   */
+  invalidation_warning?: string | null;
 }
 
 export interface WegOwnerVote {

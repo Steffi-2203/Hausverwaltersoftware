@@ -1,7 +1,7 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { db, rootDb, orgContext, appPool } from "../db";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { eq, and, desc, inArray } from "drizzle-orm";
+import { eq, and, desc, inArray, isNotNull } from "drizzle-orm";
 import * as schema from "@shared/schema";
 
 /**
@@ -422,6 +422,73 @@ export function registerOwnerPortalRoutes(app: Express) {
     } catch (error) {
       console.error("Owner portal assemblies error:", error);
       res.status(500).json({ error: "Fehler beim Laden der Versammlungen" });
+    }
+  });
+
+  /**
+   * GET /api/owner-portal/invalidated-votes
+   * Gibt Umlaufbeschlüsse zurück, die für diese Liegenschaft von passed=true
+   * auf passed=false gekippt sind (§ 24 Abs. 1 WEG 2002).
+   * Nur Stimmen der eigenen Liegenschaften — Cross-Org-Isolation über
+   * den Portal-Session-Kontext (getOwnerContext).
+   * Polling-fähig: 30 s refetchInterval im Frontend.
+   */
+  app.get("/api/owner-portal/invalidated-votes", async (req: Request, res: Response) => {
+    try {
+      const ctx = await getOwnerContext(req, res);
+      if (!ctx) return;
+
+      const propQuery = ctx.organizationId
+        ? db.select({ propertyId: schema.propertyOwners.propertyId })
+            .from(schema.propertyOwners)
+            .innerJoin(schema.properties, eq(schema.propertyOwners.propertyId, schema.properties.id))
+            .where(and(eq(schema.propertyOwners.ownerId, ctx.ownerId), eq(schema.properties.organizationId, ctx.organizationId)))
+        : db.select({ propertyId: schema.propertyOwners.propertyId })
+            .from(schema.propertyOwners)
+            .where(eq(schema.propertyOwners.ownerId, ctx.ownerId));
+
+      const propertyOwnerships = await propQuery;
+      const propertyIds = propertyOwnerships.map(po => po.propertyId);
+      if (!propertyIds.length) return res.json([]);
+
+      // Alle Versammlungen auf den eigenen Liegenschaften
+      const assemblyRows = await db
+        .select({ id: schema.wegAssemblies.id })
+        .from(schema.wegAssemblies)
+        .where(inArray(schema.wegAssemblies.propertyId, propertyIds));
+      const assemblyIds = assemblyRows.map(a => a.id);
+      if (!assemblyIds.length) return res.json([]);
+
+      // Umlaufbeschlüsse mit gesetztem invalidation_warning
+      const rows = await db
+        .select({
+          voteId:             schema.wegVoteResults.voteId,
+          invalidationWarning: schema.wegVoteResults.invalidationWarning,
+          topic:              schema.wegVotes.topic,
+          assemblyTitle:      schema.wegAssemblies.title,
+          propertyId:         schema.wegAssemblies.propertyId,
+          propertyName:       schema.properties.name,
+        })
+        .from(schema.wegVoteResults)
+        .innerJoin(schema.wegVotes,      eq(schema.wegVoteResults.voteId,    schema.wegVotes.id))
+        .innerJoin(schema.wegAssemblies, eq(schema.wegVotes.assemblyId,      schema.wegAssemblies.id))
+        .innerJoin(schema.properties,    eq(schema.wegAssemblies.propertyId, schema.properties.id))
+        .where(and(
+          inArray(schema.wegVotes.assemblyId, assemblyIds),
+          isNotNull(schema.wegVoteResults.invalidationWarning),
+        ));
+
+      res.json(rows.map(r => ({
+        voteId:             r.voteId,
+        topic:              r.topic,
+        assemblyTitle:      r.assemblyTitle,
+        propertyId:         r.propertyId,
+        propertyName:       r.propertyName,
+        invalidationWarning: r.invalidationWarning,
+      })));
+    } catch (error) {
+      console.error("Owner portal invalidated-votes error:", error);
+      res.status(500).json({ error: "Fehler beim Laden der Warnmeldungen" });
     }
   });
 

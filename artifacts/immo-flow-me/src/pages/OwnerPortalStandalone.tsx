@@ -12,7 +12,7 @@ import { format } from 'date-fns';
 import { de } from 'date-fns/locale';
 import {
   Home, Euro, FileText, Building2, Shield, LogOut,
-  Calendar, Download, FolderOpen, Users, PieChart, Landmark
+  Calendar, Download, FolderOpen, Users, PieChart, Landmark, AlertTriangle
 } from 'lucide-react';
 import immoflowLogo from '@/assets/immoflowme-logo.png';
 
@@ -90,6 +90,18 @@ export default function OwnerPortalStandalone() {
   const { data: budgets, isLoading: budLoading } = useQuery<any[]>({
     queryKey: ['/api/owner-portal/budgets'],
     enabled: session?.authenticated === true,
+  });
+
+  /**
+   * Invalidierte Umlaufbeschlüsse (passed=true → false).
+   * Polling alle 30 s damit Eigentümer die Warnung "sofort" sehen,
+   * auch wenn sie die Seite nicht neu laden (§ 24 Abs. 1 WEG 2002).
+   */
+  const { data: invalidatedVotes } = useQuery<any[]>({
+    queryKey: ['/api/owner-portal/invalidated-votes'],
+    enabled: session?.authenticated === true,
+    refetchInterval: 30_000,
+    initialData: [],
   });
 
   useEffect(() => {
@@ -251,8 +263,16 @@ export default function OwnerPortalStandalone() {
             <TabsTrigger value="settlements" data-testid="tab-owner-settlements">
               <Euro className="h-4 w-4 mr-1" /> Abrechnungen
             </TabsTrigger>
-            <TabsTrigger value="assemblies" data-testid="tab-owner-assemblies">
+            <TabsTrigger value="assemblies" data-testid="tab-owner-assemblies" className="relative">
               <Users className="h-4 w-4 mr-1" /> Versammlungen
+              {(invalidatedVotes?.length ?? 0) > 0 && (
+                <span
+                  className="ml-1.5 inline-flex items-center justify-center h-4 w-4 rounded-full bg-red-600 text-white text-[10px] font-bold"
+                  data-testid="badge-invalidated-votes-count"
+                >
+                  {invalidatedVotes!.length}
+                </span>
+              )}
             </TabsTrigger>
             <TabsTrigger value="documents" data-testid="tab-owner-documents">
               <FileText className="h-4 w-4 mr-1" /> Dokumente
@@ -509,6 +529,37 @@ export default function OwnerPortalStandalone() {
           </TabsContent>
 
           <TabsContent value="assemblies" className="space-y-4">
+            {/* Invalidierungs-Warnbanner: erscheint sofort wenn ein Umlaufbeschluss
+                von passed=true auf passed=false gekippt ist (§ 24 Abs. 1 WEG 2002).
+                Wird alle 30 s aktualisiert — kein Reload erforderlich. */}
+            {(invalidatedVotes?.length ?? 0) > 0 && (
+              <div className="space-y-2" data-testid="container-invalidation-warnings">
+                {invalidatedVotes!.map((v: any) => (
+                  <div
+                    key={v.voteId}
+                    className="flex items-start gap-3 rounded-md border border-red-300 bg-red-50 dark:bg-red-950/30 dark:border-red-700 p-4"
+                    data-testid={`alert-invalidated-vote-${v.voteId}`}
+                  >
+                    <AlertTriangle className="h-5 w-5 mt-0.5 shrink-0 text-red-600 dark:text-red-400" />
+                    <div className="space-y-1">
+                      <p className="font-semibold text-red-800 dark:text-red-300">
+                        Umlaufbeschluss nachträglich ungültig — sofortige Überprüfung erforderlich
+                      </p>
+                      <p className="text-sm text-red-700 dark:text-red-400">
+                        <span className="font-medium">{v.propertyName}</span>
+                        {' · '}
+                        <span>{v.assemblyTitle}</span>
+                        {' · '}
+                        <span>{v.topic}</span>
+                      </p>
+                      <p className="text-sm text-red-800 dark:text-red-300" data-testid={`text-invalidation-warning-portal-${v.voteId}`}>
+                        {v.invalidationWarning}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
             <Card>
               <CardHeader>
                 <CardTitle className="text-base">WEG-Versammlungen</CardTitle>
@@ -541,7 +592,7 @@ export default function OwnerPortalStandalone() {
                             <TableCell>{formatDate(a.assemblyDate)}</TableCell>
                             <TableCell>
                               <Badge variant="outline">
-                                {a.assemblyType === 'ordentlich' ? 'Ordentlich' : a.assemblyType === 'ausserordentlich' ? 'Außerordentlich' : a.assemblyType}
+                                {a.assemblyType === 'ordentlich' ? 'Ordentlich' : a.assemblyType === 'ausserordentlich' ? 'Außerordentlich' : a.assemblyType === 'umlaufbeschluss' ? 'Umlaufbeschluss' : a.assemblyType}
                               </Badge>
                             </TableCell>
                             <TableCell>{a.location || '-'}</TableCell>
