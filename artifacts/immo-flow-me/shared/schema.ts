@@ -2652,6 +2652,17 @@ export const insertAuthTokenSchema = createInsertSchema(authTokens).omit({ id: t
 export type InsertAuthToken = z.infer<typeof insertAuthTokenSchema>;
 export type AuthToken = typeof authTokens.$inferSelect;
 
+// ====== API-KEY-BRUTE-FORCE ======
+// Systemtabelle ohne organization_id. Der API-Key-Middleware-Pfad läuft
+// bewusst vor dem RLS-Org-Kontext und verwendet dafür rootDb.
+export const apiKeyBruteForce = pgTable("api_key_brute_force", {
+  keyHash: text("key_hash").primaryKey(),
+  failureCount: integer("failure_count").notNull().default(0),
+  windowStartedAt: timestamp("window_started_at", { withTimezone: true }).notNull().defaultNow(),
+  blockedUntil: timestamp("blocked_until", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // ====== PERIODENSPERREN (Audit-Befund K6/M4) ======
 
 export const periodLocks = pgTable("period_locks", {

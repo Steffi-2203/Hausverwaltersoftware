@@ -2,10 +2,12 @@
 - [Field Encryption (AES-256-GCM)](field-encryption.md) — covered tables/fields, fail-closed key rule, boot migration, common pitfall (demoService direct inserts)
 - [Write-endpoint org-isolation patterns](write-endpoint-org-isolation.md) — security patterns for POST/PATCH/DELETE org-scope enforcement; test setup for write-cross-org.test.ts
 - [Test org-context helper (addOrgContext)](test-org-context.md) — withOrgContext.ts pattern: no BEGIN/COMMIT, set_config(is_local=false), why transaction-wrapping causes rootDb verification races
+- [RLS test-fixture cleanup](rls-test-fixture-cleanup.md) — seeded integration tests must clean via rootDb or explicit org context even after setup fails
 - [Decrypt-on-read boundary](decrypt-on-read-boundary.md) — raw db.select() on encrypted columns must decrypt before responding/comparing; storage layer is the boundary
 - [Portal-access RLS pattern](portal-access-rls.md) — self-isolation via app.current_tenant/owner; mixed admin+portal sessions must set it on the existing tx client
 - [GitHub-Backup per API-Push](github-backup-push.md) — git push authentifiziert nicht; Backup via Connector-Octokit: Repo-Init, gedrosselte Blobs, Tree in 150er-Chunks
 - [rootDb vs db service pattern](rootdb-service-pattern.md) — which service functions must use rootDb and why; VPI reference checks must be cross-org
+- [rootDb system-table isolation](rootdb-system-table-isolation.md) — rootDb-only system tables need explicit RLS and immo_app privilege revocation
 - [Post-merge: kein drizzle push](post-merge-db-push.md) — lib/db-Push auf der Shared-DB würde App-Tabellen droppen; Boot-Migrationen reichen
 - [Global-table test races](global-table-test-races.md) — Tests auf globalen Tabellen (vpi_values, audit_logs) racen zwischen parallelen Testprozessen; via pg advisory lock (vpiTestLock.ts / auditLogTestLock.ts) serialisieren
 - [Test-Seed-Muster: eindeutige E-Mails](test-seed-unique-emails.md) — fixe E-Mail + zufällige Profil-ID pro Lauf = ON-CONFLICT-Skip + user_roles-FK-Fehler nach abgebrochenen Läufen; E-Mails pro Lauf eindeutig machen

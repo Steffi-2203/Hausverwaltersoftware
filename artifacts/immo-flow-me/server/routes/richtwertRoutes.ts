@@ -4,6 +4,7 @@ import { db } from "../db";
 import { tenants, units, properties, profiles, leases } from "@shared/schema";
 import { and, eq, isNull } from "drizzle-orm";
 import { checkMrgExcess, RICHTWERTE_2025, type MrgRentInput } from "../services/mrgRentCalculationService";
+import { parseMoneyInput } from "../lib/money";
 
 const router = Router();
 
@@ -64,6 +65,15 @@ router.post("/api/richtwert/calculate", isAuthenticated, async (req: Request, re
       return res.status(400).json({ error: "Ungültige Nutzfläche" });
     }
 
+    // Fixe Garage-/Stellplatzkosten sind der einzige Geldbetrag dieses
+    // Rechenendpunkts. Derselbe Bereich wie die Mietbeträge (numeric(10,2))
+    // verhindert unbrauchbare Ergebnisse bei übergroßen Eingaben.
+    const parsedGarageStellplatz = parseMoneyInput(garageStellplatz, "garageStellplatz", 8);
+    if ("error" in parsedGarageStellplatz) {
+      return res.status(400).json({ error: parsedGarageStellplatz.error });
+    }
+    const garageStellplatzAmount = Number(parsedGarageStellplatz.value);
+
     const baseRichtwert = richtwertValues[bundesland];
     const baseRent = nutzflaeche * baseRichtwert;
 
@@ -88,7 +98,7 @@ router.post("/api/richtwert/calculate", isAuthenticated, async (req: Request, re
       zustand;
 
     const adjustedRent = baseRent * (1 + sumPercentage / 100);
-    const finalRent = adjustedRent + garageStellplatz;
+    const finalRent = adjustedRent + garageStellplatzAmount;
 
     const surcharges = {
       lagezuschlag: { prozent: lagezuschlag, betrag: baseRent * (lagezuschlag / 100) },
@@ -99,11 +109,11 @@ router.post("/api/richtwert/calculate", isAuthenticated, async (req: Request, re
       befristung: { prozent: befristungProzent, betrag: baseRent * (befristungProzent / 100) },
       moeblierung: { prozent: moeblierung, betrag: baseRent * (moeblierung / 100) },
       zustand: { prozent: zustand, betrag: baseRent * (zustand / 100) },
-      garageStellplatz: { fix: true, betrag: garageStellplatz },
+      garageStellplatz: { fix: true, betrag: garageStellplatzAmount },
     };
 
     const totalSurchargesPercent = sumPercentage;
-    const totalSurchargesAmount = adjustedRent - baseRent + garageStellplatz;
+    const totalSurchargesAmount = adjustedRent - baseRent + garageStellplatzAmount;
 
     res.json({
       bundesland,

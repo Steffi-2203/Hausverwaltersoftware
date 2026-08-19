@@ -4,6 +4,7 @@ import { eq, and, sql, inArray, gte, lte } from "drizzle-orm";
 import * as schema from "../../shared/schema";
 import { isAuthenticated, requireRole, getProfileFromSession, snakeToCamel, objectToSnakeCase } from "./helpers";
 import { storage } from "../storage";
+import { validateMoneyFields } from "../lib/money";
 
 const router = Router();
 
@@ -110,9 +111,30 @@ router.post("/api/bulk/invoices", isAuthenticated, requireRole("property_manager
         const unit = unitMap.get(tenant.unitId);
         if (!unit) continue;
 
-        const grundmiete = Number(tenant.grundmiete || 0);
-        const betriebskosten = Number((tenant as any).betriebskosten || 0);
-        const heizungskosten = Number((tenant as any).heizungskosten || 0);
+        // Alle Rechnungsspalten sind numeric(10,2). Die Quellwerte stammen
+        // zwar aus bestehenden Stammdaten, ihre Summe kann aber trotzdem den
+        // engeren Wertebereich überschreiten. Daher vor jedem Insert
+        // normalisieren und die betreffende Einheit als Fehler ausweisen,
+        // statt den gesamten Bulk-Lauf mit einem DB-500 abzubrechen.
+        const invoiceAmounts: Record<string, unknown> = {
+          grundmiete: tenant.grundmiete || 0,
+          betriebskosten: (tenant as any).betriebskosten || 0,
+          heizungskosten: (tenant as any).heizungskosten || 0,
+        };
+        const sourceAmountError = validateMoneyFields(invoiceAmounts, {
+          grundmiete: "grundmiete",
+          betriebskosten: "betriebskosten",
+          heizungskosten: "heizungskosten",
+        }, 8);
+        if (sourceAmountError) {
+          const tenantName = `${tenant.firstName || ''} ${tenant.lastName || ''}`.trim();
+          errors.push(`${tenantName}: ${sourceAmountError}`);
+          continue;
+        }
+
+        const grundmiete = Number(invoiceAmounts.grundmiete);
+        const betriebskosten = Number(invoiceAmounts.betriebskosten);
+        const heizungskosten = Number(invoiceAmounts.heizungskosten);
 
         const isCommercial = ['geschaeft', 'garage', 'stellplatz', 'lager'].includes((unit.type || '').toLowerCase());
         const ustSatzMiete = isCommercial ? 20 : 10;
@@ -125,17 +147,27 @@ router.post("/api/bulk/invoices", isAuthenticated, requireRole("property_manager
         const ust = Math.round((ustMiete + ustBk + ustHk) * 100) / 100;
 
         const gesamtbetrag = grundmiete + betriebskosten + heizungskosten;
+        const calculatedAmounts: Record<string, unknown> = { ust, gesamtbetrag };
+        const calculatedAmountError = validateMoneyFields(calculatedAmounts, {
+          ust: "ust",
+          gesamtbetrag: "gesamtbetrag",
+        }, 8);
+        if (calculatedAmountError) {
+          const tenantName = `${tenant.firstName || ''} ${tenant.lastName || ''}`.trim();
+          errors.push(`${tenantName}: ${calculatedAmountError}`);
+          continue;
+        }
 
         await db.insert(schema.monthlyInvoices).values({
           tenantId: tenant.id,
           unitId: unit.id,
           year,
           month,
-          grundmiete: grundmiete.toString(),
-          betriebskosten: betriebskosten.toString(),
-          heizungskosten: heizungskosten.toString(),
-          gesamtbetrag: gesamtbetrag.toString(),
-          ust: ust.toString(),
+          grundmiete: invoiceAmounts.grundmiete as string,
+          betriebskosten: invoiceAmounts.betriebskosten as string,
+          heizungskosten: invoiceAmounts.heizungskosten as string,
+          gesamtbetrag: calculatedAmounts.gesamtbetrag as string,
+          ust: calculatedAmounts.ust as string,
           ustSatzMiete: ustSatzMiete.toString(),
           ustSatzBk: ustSatzBk.toString(),
           ustSatzHeizung: ustSatzHeizung.toString(),

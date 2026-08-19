@@ -3,6 +3,7 @@ import { db } from "../db";
 import { eaBookings, properties } from "@shared/schema";
 import { eq, and, desc, gte, lte, sql } from "drizzle-orm";
 import { isAuthenticated, requireMutationAccess } from "./helpers";
+import { parseMoneyInput } from "../lib/money";
 
 const router = Router();
 
@@ -61,22 +62,39 @@ router.post("/api/ea-rechnung/bookings", isAuthenticated, requireMutationAccess(
       return res.status(403).json({ error: "Kein Zugriff auf diese Liegenschaft" });
     }
 
-    const grossAmount = Number(body.amount);
-    const taxRate = Number(body.taxRate || 20);
+    // ea_bookings.amount/net_amount/tax_amount sind numeric(10,2) → max. 8
+    // Vorkommastellen. Auch die abgeleiteten Werte werden vor dem Insert
+    // normalisiert, damit kein Postgres-Range-Fehler als 500 durchkommt.
+    const parsedAmount = parseMoneyInput(body.amount, "amount", 8);
+    if ("error" in parsedAmount) return res.status(400).json({ error: parsedAmount.error });
+
+    const parsedTaxRate = parseMoneyInput(body.taxRate ?? 20, "taxRate", 3);
+    if ("error" in parsedTaxRate) return res.status(400).json({ error: parsedTaxRate.error });
+
+    const grossAmount = Number(parsedAmount.value);
+    const taxRate = Number(parsedTaxRate.value);
+    if (taxRate < 0 || taxRate > 100) {
+      return res.status(400).json({ error: "taxRate muss zwischen 0 und 100 liegen" });
+    }
+
     const netAmount = grossAmount / (1 + taxRate / 100);
     const taxAmount = grossAmount - netAmount;
+    const parsedNetAmount = parseMoneyInput(netAmount, "netAmount", 8);
+    if ("error" in parsedNetAmount) return res.status(400).json({ error: parsedNetAmount.error });
+    const parsedTaxAmount = parseMoneyInput(taxAmount, "taxAmount", 8);
+    if ("error" in parsedTaxAmount) return res.status(400).json({ error: parsedTaxAmount.error });
 
     const [booking] = await db.insert(eaBookings).values({
       organizationId: orgId,
       propertyId: body.propertyId || null,
       type: body.type,
       date: body.date,
-      amount: String(grossAmount),
+      amount: parsedAmount.value,
       description: body.description,
       category: body.category,
-      taxRate: String(taxRate),
-      netAmount: String(Math.round(netAmount * 100) / 100),
-      taxAmount: String(Math.round(taxAmount * 100) / 100),
+      taxRate: parsedTaxRate.value,
+      netAmount: parsedNetAmount.value,
+      taxAmount: parsedTaxAmount.value,
       documentRef: body.documentRef || null,
       belegNummer: body.belegNummer || null,
     }).returning();

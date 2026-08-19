@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import express, { Request, Response } from "express";
 import request from "supertest";
 import { createApiKeyAuth } from "../../server/middleware/apiKey";
+import { InMemoryBruteForceStore } from "../../server/middleware/bruteForceStore";
 import adminRoutes, { _apiKeyManagementStore, _apiKeyManagementLimiter } from "../../server/routes/adminRoutes";
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -40,7 +41,7 @@ function buildApp(correctKey: string = CORRECT_KEY) {
     if (orgId === TEST_ORG_B) return { id: TEST_ORG_B, readonlyApiKey: "key-for-org-b" };
     return undefined;
   };
-  app.use(createApiKeyAuth(mockLookup));
+  app.use(createApiKeyAuth(mockLookup, { store: new InMemoryBruteForceStore() }));
   app.get("/api/readonly/test", (_req: Request, res: Response) => res.json({ ok: true }));
   return app;
 }
@@ -187,7 +188,7 @@ describe("apiKeyAuth — Brute-Force-Schutz (org-basierter Zaehler)", () => {
       // der XFF-Bypass-Pfad existiert schlicht nicht.
       const middleware = createApiKeyAuth(
         async (orgId) => ({ id: orgId, readonlyApiKey: "key" }),
-        { maxMapSize: 5 },
+        { maxMapSize: 5, store: new InMemoryBruteForceStore({ maxMapSize: 5 }) },
       );
       const app = express();
       app.set("trust proxy", 1); // Produktionskonfiguration
@@ -225,7 +226,7 @@ describe("apiKeyAuth — Kapazitaetsgrenze absolut (kein unbegrenztes Wachstum)"
     const middleware = createApiKeyAuth(
       async (orgId) =>
         orgId.startsWith("cap-") ? { id: orgId, readonlyApiKey: "key" } : undefined,
-      { maxMapSize: MAP_CAP },
+        { maxMapSize: MAP_CAP, store: new InMemoryBruteForceStore({ maxMapSize: MAP_CAP }) },
     );
     const app = express();
     app.use(middleware);
@@ -302,7 +303,7 @@ describe("apiKeyAuth — Kapazitaetsgrenze absolut (kein unbegrenztes Wachstum)"
           }
           return undefined; // unbekannte Org
         },
-        { maxMapSize: MAP_CAP },
+        { maxMapSize: MAP_CAP, store: new InMemoryBruteForceStore({ maxMapSize: MAP_CAP }) },
       );
       const app = express();
       app.use(middleware);
@@ -373,7 +374,7 @@ describe("apiKeyAuth — Kapazitaetsgrenze absolut (kein unbegrenztes Wachstum)"
       const TARGET = "lockout-regression-target";
       const middleware = createApiKeyAuth(
         async (orgId) => ({ id: orgId, readonlyApiKey: "key" }),
-        { maxMapSize: MAP_CAP },
+        { maxMapSize: MAP_CAP, store: new InMemoryBruteForceStore({ maxMapSize: MAP_CAP }) },
       );
       const app = express();
       app.use(middleware);

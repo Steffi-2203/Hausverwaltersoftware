@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { sql } from "drizzle-orm";
+import { rootDb } from "../db";
+
 /**
  * Brute-Force-Zaehler-Stores fuer die API-Key-Middleware.
  *
@@ -6,13 +10,15 @@
  *   Tier 2 — Fehlversuch-Zaehler: zaehlt Fehlversuche pro Key.
  *
  * Implementierungen:
- *   - InMemoryBruteForceStore: bisheriges Map-basiertes Verhalten (Default ohne REDIS_URL,
- *     und fuer Tests).
+ *   - InMemoryBruteForceStore: prozesslokales Verhalten für Tests und einen
+ *     expliziten Notfall-Fallback.
  *   - RedisBruteForceStore: INCR + PEXPIRE (Zaehler) und SET PX (Sperre). Ueberlebt
  *     Server-Neustarts und funktioniert ueber mehrere Prozesse hinweg.
+ *   - PostgresBruteForceStore: persistenter Produktions-Store in der vorhandenen
+ *     PostgreSQL-Datenbank; kein externer Redis-Dienst nötig.
  *
- * Der Redis-Client ist injizierbar (MinimalRedisClient) — Tests koennen einen
- * In-Memory-Fake verwenden, Produktion nutzt node-redis via REDIS_URL.
+ * Der Redis-Client bleibt für bestehende Tests injizierbar. Der Standardpfad
+ * für die API-Key-Middleware verwendet PostgreSQL.
  */
 
 export interface BruteForceStoreOptions {
@@ -191,6 +197,163 @@ export class RedisBruteForceStore implements BruteForceStore {
   async _lockoutSize(): Promise<number> { return this.countKeys(LOCK_PREFIX + "*"); }
 }
 
+// ── PostgreSQL ────────────────────────────────────────────────────────────────
+
+function hashBruteForceKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+/**
+ * Persistenter Store für den API-Key-Pfad.
+ *
+ * Der Zähler-Schlüssel wird nur als Hash abgelegt, damit IP-basierte Schlüssel
+ * nicht im Klartext in der Datenbank landen. Der UPSERT zählt atomar hoch und
+ * bleibt daher auch bei parallelen App-Prozessen korrekt.
+ */
+export class PostgresBruteForceStore implements BruteForceStore {
+  private readonly blockDurationMs: number;
+  private readonly maxFailedAttempts: number;
+  private nextCleanupAt = 0;
+  private static readonly cleanupIntervalMs = 5 * 60_000;
+  private static readonly cleanupBatchSize = 500;
+
+  constructor(
+    options: BruteForceStoreOptions = {},
+    private readonly database: typeof rootDb = rootDb,
+  ) {
+    this.blockDurationMs = options.blockDurationMs ?? 60_000;
+    this.maxFailedAttempts = options.maxFailedAttempts ?? 10;
+  }
+
+  /**
+   * Begrenzte Bereinigung abgelaufener Sperren/Zähler. Sie läuft höchstens alle
+   * fünf Minuten pro Store-Instanz und löscht pro Durchlauf maximal 500 Zeilen,
+   * damit eine alte Tabelle keinen normalen API-Request ausbremst.
+   */
+  private async cleanupExpiredRows(): Promise<void> {
+    if (Date.now() < this.nextCleanupAt) return;
+    this.nextCleanupAt = Date.now() + PostgresBruteForceStore.cleanupIntervalMs;
+    await this.database.execute(sql`
+      DELETE FROM api_key_brute_force
+      WHERE ctid IN (
+        SELECT ctid
+        FROM api_key_brute_force
+        WHERE (blocked_until IS NOT NULL AND blocked_until <= NOW())
+           OR (blocked_until IS NULL AND window_started_at <= NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond'))
+        ORDER BY updated_at
+        LIMIT ${PostgresBruteForceStore.cleanupBatchSize}
+      )
+    `);
+  }
+
+  async isBlocked(key: string): Promise<boolean> {
+    await this.cleanupExpiredRows();
+    const keyHash = hashBruteForceKey(key);
+    const result = await this.database.execute(sql`
+      SELECT failure_count, window_started_at, blocked_until
+      FROM api_key_brute_force
+      WHERE key_hash = ${keyHash}
+      LIMIT 1
+    `);
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    if (!row) return false;
+
+    const now = Date.now();
+    const blockedUntil = row.blocked_until instanceof Date
+      ? row.blocked_until.getTime()
+      : row.blocked_until ? new Date(String(row.blocked_until)).getTime() : null;
+    if (blockedUntil !== null && blockedUntil > now) return true;
+
+    const windowStartedAt = row.window_started_at instanceof Date
+      ? row.window_started_at.getTime()
+      : new Date(String(row.window_started_at)).getTime();
+    if (blockedUntil !== null || now - windowStartedAt >= this.blockDurationMs) {
+      await this.database.execute(sql`
+        DELETE FROM api_key_brute_force
+        WHERE key_hash = ${keyHash}
+          AND (
+            (blocked_until IS NOT NULL AND blocked_until <= NOW())
+            OR (blocked_until IS NULL AND window_started_at <= NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond'))
+          )
+      `);
+      return false;
+    }
+
+    return Number(row.failure_count) >= this.maxFailedAttempts;
+  }
+
+  async recordFailure(key: string): Promise<void> {
+    await this.cleanupExpiredRows();
+    const keyHash = hashBruteForceKey(key);
+    await this.database.execute(sql`
+      INSERT INTO api_key_brute_force
+        (key_hash, failure_count, window_started_at, blocked_until, updated_at)
+      VALUES
+        (${keyHash}, 1, NOW(), NULL, NOW())
+      ON CONFLICT (key_hash) DO UPDATE SET
+        failure_count = CASE
+          WHEN api_key_brute_force.blocked_until IS NOT NULL
+            AND api_key_brute_force.blocked_until > NOW()
+            THEN api_key_brute_force.failure_count
+          WHEN api_key_brute_force.window_started_at <= NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond')
+            THEN 1
+          ELSE api_key_brute_force.failure_count + 1
+        END,
+        window_started_at = CASE
+          WHEN api_key_brute_force.blocked_until IS NOT NULL
+            AND api_key_brute_force.blocked_until > NOW()
+            THEN api_key_brute_force.window_started_at
+          WHEN api_key_brute_force.window_started_at <= NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond')
+            THEN NOW()
+          ELSE api_key_brute_force.window_started_at
+        END,
+        blocked_until = CASE
+          WHEN api_key_brute_force.blocked_until IS NOT NULL
+            AND api_key_brute_force.blocked_until > NOW()
+            THEN api_key_brute_force.blocked_until
+          WHEN api_key_brute_force.window_started_at <= NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond')
+            THEN NULL
+          WHEN api_key_brute_force.failure_count + 1 >= ${this.maxFailedAttempts}
+            THEN NOW() + (${this.blockDurationMs} * INTERVAL '1 millisecond')
+          ELSE NULL
+        END,
+        updated_at = NOW()
+    `);
+  }
+
+  async clearFailures(key: string): Promise<void> {
+    const keyHash = hashBruteForceKey(key);
+    await this.database.execute(sql`
+      UPDATE api_key_brute_force
+      SET failure_count = 0,
+          window_started_at = NOW(),
+          updated_at = NOW()
+      WHERE key_hash = ${keyHash}
+        AND (blocked_until IS NULL OR blocked_until <= NOW())
+    `);
+  }
+
+  async _counterSize(): Promise<number> {
+    const result = await this.database.execute(sql`
+      SELECT COUNT(*)::int AS count
+      FROM api_key_brute_force
+      WHERE blocked_until IS NULL
+        AND failure_count > 0
+        AND window_started_at > NOW() - (${this.blockDurationMs} * INTERVAL '1 millisecond')
+    `);
+    return Number((result.rows[0] as Record<string, unknown> | undefined)?.count ?? 0);
+  }
+
+  async _lockoutSize(): Promise<number> {
+    const result = await this.database.execute(sql`
+      SELECT COUNT(*)::int AS count
+      FROM api_key_brute_force
+      WHERE blocked_until > NOW()
+    `);
+    return Number((result.rows[0] as Record<string, unknown> | undefined)?.count ?? 0);
+  }
+}
+
 // ── Default-Factory ──────────────────────────────────────────────────────────
 
 let sharedRedisClient: Promise<MinimalRedisClient> | null = null;
@@ -230,22 +393,11 @@ async function getSharedRedisClient(url: string, connectTimeoutMs: number): Prom
 }
 
 /**
- * Erzeugt den Default-Store:
- *   - REDIS_URL gesetzt → RedisBruteForceStore (Verbindung lazy, Fehler → Fallback siehe apiKey.ts)
- *   - sonst → InMemoryBruteForceStore (mit Warnung, da Neustarts den Zaehler leeren)
+ * Erzeugt den dauerhaften Standard-Store. Redis bleibt nur für kompatible
+ * Tests oder eine explizite Injection verfügbar.
  */
 export function createDefaultBruteForceStore(options: BruteForceStoreOptions = {}): BruteForceStore {
-  const url = process.env.REDIS_URL;
-  if (!url) {
-    if (process.env.NODE_ENV === "production") {
-      console.warn(
-        "[bruteForceStore] REDIS_URL nicht gesetzt — Brute-Force-Zaehler laeuft in-memory " +
-        "und wird bei Neustart/Scaling zurueckgesetzt.",
-      );
-    }
-    return new InMemoryBruteForceStore(options);
-  }
-  return new LazyRedisBruteForceStore(url, options);
+  return new PostgresBruteForceStore(options);
 }
 
 /**

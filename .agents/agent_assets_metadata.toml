@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "NQjYlw4GsAEBHP2jbOHYG"
+uri = "file://.agents/outputs/buchhaltung-abrechnung-arbeitsweg-pruefung-2026-08-19.md"
+type = "text"
+title = "Prüfbericht Buchhaltung & Abrechnung"
+description = "Bestandsaufnahme des tatsächlichen Arbeitswegs mit Testbelegen, Handrechnungen, Bruchstellen und nachgewiesener Testdaten-Bereinigung."
+logical_id = "0bcd6b5f-0e82-4388-89c7-9507a9b64b3c"
+content_hash = "sha256:0ad6ece7c3d9a88a0addb97c675c24d5e87c3ca8b813323dc634974d2ab61fe5"
+size = 14042
+mtime_ms = 1787160818163
+storage_uri = "gcs://replit-rams-assets-sisko/rams/assets/repl:5a81828e-1a52-4cac-8c56-a547a5ba6c73/0bcd6b5f-0e82-4388-89c7-9507a9b64b3c/b6f80f27-24ca-44d6-a9dd-443a6f6a11ed"
+storage_version_token = "1787160838271065"
+content_type = "text/markdown"

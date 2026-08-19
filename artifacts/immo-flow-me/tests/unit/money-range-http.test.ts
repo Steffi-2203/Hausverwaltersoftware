@@ -21,6 +21,9 @@ import { rootDb as db } from "../../server/db";
 import financeRoutes from "../../server/routes/financeRoutes";
 import kautionRoutes from "../../server/routes/kautionRoutes";
 import accountingRoutes from "../../server/routes/accountingRoutes";
+import heatBillingRoutes from "../../server/routes/heatBillingRoutes";
+import eaRechnungRoutes from "../../server/routes/eaRechnungRoutes";
+import richtwertRoutes from "../../server/routes/richtwertRoutes";
 import { addOrgContext } from "../helpers/withOrgContext";
 
 const orgId = randomUUID();
@@ -45,6 +48,9 @@ function buildApp() {
   app.use(financeRoutes);
   app.use(kautionRoutes);
   app.use(accountingRoutes);
+  app.use(heatBillingRoutes);
+  app.use(eaRechnungRoutes);
+  app.use(richtwertRoutes);
   return app;
 }
 
@@ -56,7 +62,7 @@ describe("Geld-Schreibpfade: 400 statt 500 bei zu großen Beträgen", () => {
     await db.execute(sql`INSERT INTO profiles (id, email, organization_id) VALUES (${profileId}::uuid, ${email}, ${orgId}::uuid) ON CONFLICT DO NOTHING`);
     await db.execute(sql`INSERT INTO user_roles (user_id, role) VALUES (${profileId}::uuid, 'admin') ON CONFLICT DO NOTHING`);
     await db.execute(sql`INSERT INTO properties (id, organization_id, name, address, city, postal_code) VALUES (${propId}::uuid, ${orgId}::uuid, 'MR-Obj', 'Testgasse 2', 'Wien', '1010') ON CONFLICT DO NOTHING`);
-    await db.execute(sql`INSERT INTO units (id, property_id, top_nummer, type, status) VALUES (${unitId}::uuid, ${propId}::uuid, 'MR-Top1', 'wohnung', 'aktiv') ON CONFLICT DO NOTHING`);
+    await db.execute(sql`INSERT INTO units (id, property_id, top_nummer, type, status, flaeche) VALUES (${unitId}::uuid, ${propId}::uuid, 'MR-Top1', 'wohnung', 'aktiv', 100) ON CONFLICT DO NOTHING`);
     await db.execute(sql`INSERT INTO tenants (id, unit_id, first_name, last_name, email, status) VALUES (${tenantId}::uuid, ${unitId}::uuid, 'Money', 'Range', ${"mr-tenant-" + tenantId.slice(0, 8) + "@test.local"}, 'aktiv') ON CONFLICT DO NOTHING`);
     await db.execute(sql`INSERT INTO owners (id, organization_id, first_name, last_name) VALUES (${ownerId}::uuid, ${orgId}::uuid, 'Money', 'Owner') ON CONFLICT DO NOTHING`);
     await db.execute(sql`INSERT INTO monthly_invoices (id, tenant_id, unit_id, year, month, grundmiete, gesamtbetrag, status) VALUES (${invoiceId}::uuid, ${tenantId}::uuid, ${unitId}::uuid, 2044, 3, 0, 99999999.99, 'offen') ON CONFLICT DO NOTHING`);
@@ -65,6 +71,9 @@ describe("Geld-Schreibpfade: 400 statt 500 bei zu großen Beträgen", () => {
   });
 
   after(async () => {
+    await db.execute(sql`DELETE FROM heat_billing_audit_log WHERE run_id IN (SELECT id FROM heat_billing_runs WHERE organization_id = ${orgId}::uuid)`);
+    await db.execute(sql`DELETE FROM heat_billing_lines WHERE run_id IN (SELECT id FROM heat_billing_runs WHERE organization_id = ${orgId}::uuid)`);
+    await db.execute(sql`DELETE FROM heat_billing_runs WHERE organization_id = ${orgId}::uuid`);
     await db.execute(sql`DELETE FROM kautions_bewegungen WHERE kaution_id IN (SELECT id FROM kautionen WHERE organization_id = ${orgId}::uuid)`);
     await db.execute(sql`DELETE FROM kautionen WHERE organization_id = ${orgId}::uuid`);
     await db.execute(sql`DELETE FROM owner_payouts WHERE organization_id = ${orgId}::uuid`);
@@ -216,5 +225,63 @@ describe("Geld-Schreibpfade: 400 statt 500 bei zu großen Beträgen", () => {
     });
     assert.equal(res.status, 400, JSON.stringify(res.body));
     assert.ok(res.body.error.includes("zinssatz"), res.body.error);
+  });
+
+  // ── 6. POST /api/heizkosten/runs (heat_billing_runs numeric(12,2)) ─────────
+  test("heizkosten: 11 Vorkommastellen → 400 mit Feldname", async () => {
+    const res = await request(app).post("/api/heizkosten/runs").send({
+      propertyId: propId,
+      periodFrom: "2044-01-01",
+      periodTo: "2044-12-31",
+      heatingSupplyCost: "10000000000",
+    });
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.ok(res.body.error.includes("heatingSupplyCost"), res.body.error);
+  });
+
+  test("heizkosten: gültige Einzelkosten mit überlaufender Gesamtsumme → 400 statt 500", async () => {
+    const maxRunAmount = "9999999999.99";
+    const runResponse = await request(app).post("/api/heizkosten/runs").send({
+      propertyId: propId,
+      periodFrom: "2045-01-01",
+      periodTo: "2045-12-31",
+      heatingSupplyCost: maxRunAmount,
+      hotWaterSupplyCost: maxRunAmount,
+      maintenanceCost: maxRunAmount,
+      meterReadingCost: maxRunAmount,
+    });
+    assert.equal(runResponse.status, 200, JSON.stringify(runResponse.body));
+
+    const computeResponse = await request(app).post("/api/heizkosten/compute").send({
+      runId: runResponse.body.id,
+      unitData: [{ unitId, prepayment: "0" }],
+    });
+    assert.equal(computeResponse.status, 400, JSON.stringify(computeResponse.body));
+    assert.ok(computeResponse.body.error.includes("totalCost"), computeResponse.body.error);
+  });
+
+  // ── 7. POST /api/ea-rechnung/bookings (ea_bookings numeric(10,2)) ─────────
+  test("E/A-Rechnung: 9 Vorkommastellen → 400 mit Feldname", async () => {
+    const res = await request(app).post("/api/ea-rechnung/bookings").send({
+      propertyId: propId,
+      type: "ausgabe",
+      date: "2044-03-10",
+      amount: "100000000",
+      description: "Zu großer Testbetrag",
+      category: "Test",
+    });
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.ok(res.body.error.includes("amount"), res.body.error);
+  });
+
+  // ── 8. POST /api/richtwert/calculate (fixe Stellplatzkosten) ──────────────
+  test("Richtwert: zu große Stellplatzkosten → 400 mit Feldname", async () => {
+    const res = await request(app).post("/api/richtwert/calculate").send({
+      bundesland: "Wien",
+      nutzflaeche: 50,
+      garageStellplatz: "100000000",
+    });
+    assert.equal(res.status, 400, JSON.stringify(res.body));
+    assert.ok(res.body.error.includes("garageStellplatz"), res.body.error);
   });
 });

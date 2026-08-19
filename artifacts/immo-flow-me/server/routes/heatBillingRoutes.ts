@@ -4,8 +4,30 @@ import { heatBillingRuns, heatBillingLines, heatBillingAuditLog, units, tenants,
 import { eq, and, desc } from "drizzle-orm";
 import { isAuthenticated, requireMutationAccess } from "./helpers";
 import { heatBillingService, HeatBillingInput } from "../services/heatBillingService";
+import { parseMoneyInput, validateMoneyFields } from "../lib/money";
 
 const router = Router();
+
+const HEAT_BILLING_COST_FIELDS = {
+  heatingSupplyCost: "heatingSupplyCost",
+  hotWaterSupplyCost: "hotWaterSupplyCost",
+  maintenanceCost: "maintenanceCost",
+  meterReadingCost: "meterReadingCost",
+};
+
+const HEAT_BILLING_LINE_MONEY_FIELDS = {
+  heatingConsumptionShare: "heatingConsumptionShare",
+  heatingAreaShare: "heatingAreaShare",
+  heatingTotal: "heatingTotal",
+  hotWaterConsumptionShare: "hotWaterConsumptionShare",
+  hotWaterAreaShare: "hotWaterAreaShare",
+  hotWaterTotal: "hotWaterTotal",
+  maintenanceShare: "maintenanceShare",
+  meterReadingShare: "meterReadingShare",
+  totalCost: "totalCost",
+  prepayment: "prepayment",
+  balance: "balance",
+};
 
 function getOrgId(req: any): string | null {
   return req.session?.organizationId || null;
@@ -41,6 +63,11 @@ router.post("/api/heizkosten/runs", isAuthenticated, requireMutationAccess(), as
   try {
     const orgId = getOrgId(req);
     if (!orgId) return res.status(401).json({ error: "Nicht autorisiert" });
+
+    // heat_billing_runs.*_cost sind numeric(12,2) → max. 10 Vorkommastellen.
+    // Vor der Destrukturierung validieren, weil die Funktion den Body normalisiert.
+    const moneyError = validateMoneyFields(req.body, HEAT_BILLING_COST_FIELDS);
+    if (moneyError) return res.status(400).json({ error: moneyError });
 
     const {
       propertyId, periodFrom, periodTo,
@@ -92,10 +119,10 @@ router.post("/api/heizkosten/runs", isAuthenticated, requireMutationAccess(), as
       propertyId,
       periodFrom,
       periodTo,
-      heatingSupplyCost: String(heatingSupplyCost || 0),
-      hotWaterSupplyCost: String(hotWaterSupplyCost || 0),
-      maintenanceCost: String(maintenanceCost || 0),
-      meterReadingCost: String(meterReadingCost || 0),
+      heatingSupplyCost: heatingSupplyCost || "0.00",
+      hotWaterSupplyCost: hotWaterSupplyCost || "0.00",
+      maintenanceCost: maintenanceCost || "0.00",
+      meterReadingCost: meterReadingCost || "0.00",
       heatingConsumptionSharePct: String(hcPct),
       heatingAreaSharePct: String(haPct),
       hotWaterConsumptionSharePct: String(hwcPct),
@@ -154,6 +181,20 @@ router.post("/api/heizkosten/compute", isAuthenticated, requireMutationAccess(),
     if (!runId) return res.status(400).json({ error: "runId ist erforderlich" });
     if (!unitData || !Array.isArray(unitData) || unitData.length === 0) {
       return res.status(400).json({ error: "unitData ist erforderlich" });
+    }
+
+    // heat_billing_lines.prepayment ist numeric(12,2). Die Vorauszahlung kommt
+    // pro Einheit direkt aus dem Request und muss vor der Berechnung begrenzt
+    // werden, damit ein DB-Range-Fehler nicht als 500 endet.
+    for (const [index, unit] of unitData.entries()) {
+      if (!unit || typeof unit !== "object") {
+        return res.status(400).json({ error: `unitData[${index}]: Objekt erwartet` });
+      }
+      if (unit.prepayment === undefined || unit.prepayment === null || unit.prepayment === "") continue;
+
+      const parsedPrepayment = parseMoneyInput(unit.prepayment, `unitData[${index}].prepayment`);
+      if ("error" in parsedPrepayment) return res.status(400).json({ error: parsedPrepayment.error });
+      unit.prepayment = parsedPrepayment.value;
     }
 
     const [run] = await db.select()
@@ -230,9 +271,52 @@ router.post("/api/heizkosten/compute", isAuthenticated, requireMutationAccess(),
 
     const result = heatBillingService.compute(input);
 
+    // Kostenfelder dürfen einzeln bis zu numeric(12,2) reichen. Ihre Summe
+    // kann jedoch eine abgeleitete Zeile oder die Gesamtsumme über denselben
+    // DB-Bereich hinausheben. Alle tatsächlich persistierten Geldwerte daher
+    // nach der Berechnung prüfen, bevor vorhandene Zeilen gelöscht werden.
+    const normalizedLineAmounts: Array<Record<string, unknown>> = [];
+    for (const [index, line] of result.lines.entries()) {
+      const lineAmounts: Record<string, unknown> = {
+        heatingConsumptionShare: line.heatingConsumptionShare,
+        heatingAreaShare: line.heatingAreaShare,
+        heatingTotal: line.heatingTotal,
+        hotWaterConsumptionShare: line.hotWaterConsumptionShare,
+        hotWaterAreaShare: line.hotWaterAreaShare,
+        hotWaterTotal: line.hotWaterTotal,
+        maintenanceShare: line.maintenanceShare,
+        meterReadingShare: line.meterReadingShare,
+        totalCost: line.totalCost,
+        prepayment: line.prepayment,
+        balance: line.balance,
+      };
+      const lineMoneyError = validateMoneyFields(lineAmounts, HEAT_BILLING_LINE_MONEY_FIELDS);
+      if (lineMoneyError) {
+        return res.status(400).json({ error: `unitData[${index}]: ${lineMoneyError}` });
+      }
+      normalizedLineAmounts.push(lineAmounts);
+    }
+
+    const summaryAmounts: Record<string, unknown> = {
+      totalDistributed: result.summary.totalDistributed,
+    };
+    const totalDistributedError = validateMoneyFields(summaryAmounts, {
+      totalDistributed: "totalDistributed",
+    });
+    if (totalDistributedError) return res.status(400).json({ error: totalDistributedError });
+
+    // trial_balance_diff ist numeric(12,4) und damit auf acht
+    // Vorkommastellen begrenzt. Der Wert ist cent-genau; parseMoneyInput
+    // normalisiert ihn deshalb ohne Genauigkeitsverlust für die DB.
+    const parsedTrialBalanceDiff = parseMoneyInput(result.summary.trialBalanceDiff, "trialBalanceDiff", 8);
+    if ("error" in parsedTrialBalanceDiff) {
+      return res.status(400).json({ error: parsedTrialBalanceDiff.error });
+    }
+
     await db.delete(heatBillingLines).where(eq(heatBillingLines.runId, runId));
 
-    for (const line of result.lines) {
+    for (const [index, line] of result.lines.entries()) {
+      const lineAmounts = normalizedLineAmounts[index]!;
       await db.insert(heatBillingLines).values({
         runId,
         unitId: line.unitId,
@@ -245,17 +329,17 @@ router.post("/api/heizkosten/compute", isAuthenticated, requireMutationAccess(),
         heatingMeterMissing: line.heatingMeterMissing,
         hotWaterMeterValue: line.hotWaterMeterValue != null ? String(line.hotWaterMeterValue) : null,
         hotWaterMeterMissing: line.hotWaterMeterMissing,
-        heatingConsumptionShare: String(line.heatingConsumptionShare),
-        heatingAreaShare: String(line.heatingAreaShare),
-        heatingTotal: String(line.heatingTotal),
-        hotWaterConsumptionShare: String(line.hotWaterConsumptionShare),
-        hotWaterAreaShare: String(line.hotWaterAreaShare),
-        hotWaterTotal: String(line.hotWaterTotal),
-        maintenanceShare: String(line.maintenanceShare),
-        meterReadingShare: String(line.meterReadingShare),
-        totalCost: String(line.totalCost),
-        prepayment: String(line.prepayment),
-        balance: String(line.balance),
+        heatingConsumptionShare: lineAmounts.heatingConsumptionShare as string,
+        heatingAreaShare: lineAmounts.heatingAreaShare as string,
+        heatingTotal: lineAmounts.heatingTotal as string,
+        hotWaterConsumptionShare: lineAmounts.hotWaterConsumptionShare as string,
+        hotWaterAreaShare: lineAmounts.hotWaterAreaShare as string,
+        hotWaterTotal: lineAmounts.hotWaterTotal as string,
+        maintenanceShare: lineAmounts.maintenanceShare as string,
+        meterReadingShare: lineAmounts.meterReadingShare as string,
+        totalCost: lineAmounts.totalCost as string,
+        prepayment: lineAmounts.prepayment as string,
+        balance: lineAmounts.balance as string,
         isEstimated: line.isEstimated,
         estimationReason: line.estimationReason || null,
         plausibilityFlags: line.plausibilityFlags,
@@ -264,8 +348,8 @@ router.post("/api/heizkosten/compute", isAuthenticated, requireMutationAccess(),
 
     await db.update(heatBillingRuns)
       .set({
-        totalDistributed: String(result.summary.totalDistributed),
-        trialBalanceDiff: String(result.summary.trialBalanceDiff),
+        totalDistributed: summaryAmounts.totalDistributed as string,
+        trialBalanceDiff: parsedTrialBalanceDiff.value,
         complianceCheckResult: result.complianceCheck,
         warnings: result.warnings,
         computedAt: new Date(),

@@ -49,8 +49,8 @@ export interface ApiKeyAuthOptions {
   maxFailedAttempts?: number; // Schwellwert, default: 10
   cleanupIntervalMs?: number; // Cleanup-Intervall (nur In-Memory), default: 5 * 60_000
   /**
-   * Injizierbarer Zaehler-Store. Default: Redis wenn REDIS_URL gesetzt
-   * (ueberlebt Neustarts/Scaling), sonst In-Memory.
+   * Injizierbarer Zaehler-Store. Default: PostgreSQL (ueberlebt
+   * Neustarts/Scaling), In-Memory/Redis nur bei expliziter Injection.
    */
   store?: BruteForceStore;
 }
@@ -75,7 +75,7 @@ export function createApiKeyAuth(
   lookupOrg: OrgLookupFn = defaultOrgLookup,
   options: ApiKeyAuthOptions = {},
 ) {
-  // Injizierbarer Store; Default: Redis (REDIS_URL) oder In-Memory.
+  // Injizierbarer Store; Default: persistenter PostgreSQL-Store.
   // Die Zwei-Tier-Logik (Sperren vs. Zaehler) lebt jetzt in bruteForceStore.ts.
   const store: BruteForceStore = options.store ?? createDefaultBruteForceStore(options);
 
