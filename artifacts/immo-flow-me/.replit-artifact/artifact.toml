@@ -18,6 +18,9 @@ run = "pnpm --filter @workspace/immo-flow-me run dev"
 build = [ "pnpm", "--filter", "@workspace/immo-flow-me", "run", "build" ]
 run = "pnpm --filter @workspace/immo-flow-me run start"
 
+[services.production.health.startup]
+path = "/api/healthz"
+
 [services.env]
 PORT = "23964"
 BASE_PATH = "/"

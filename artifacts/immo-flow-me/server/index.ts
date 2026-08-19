@@ -24,6 +24,7 @@ import { registerOwnerPortalRoutes } from "./routes/ownerPortalRoutes";
 import { registerOwnerAuthRoutes } from "./routes/ownerAuthRoutes";
 import { registerMetricsRoutes } from "./routes/metricsRoutes";
 import { registerRetestRoutes } from "./routes/retestRoutes";
+import { registerPlaintextIbanGuardRoutes } from "./routes/plaintextIbanGuardRoutes";
 import { setupVite, serveStatic, log, logInfo, logError } from "./vite";
 import { runMigrations } from 'stripe-replit-sync';
 import { getStripeSync } from './stripeClient';
@@ -473,6 +474,7 @@ async function initStripe() {
   registerOwnerAuthRoutes(app);
   registerOwnerPortalRoutes(app);
   registerMetricsRoutes(app);
+  registerPlaintextIbanGuardRoutes(app);
   registerRetestRoutes(app);
   const server = await registerRoutes(app);
 

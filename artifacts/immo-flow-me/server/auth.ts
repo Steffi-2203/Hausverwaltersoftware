@@ -248,8 +248,12 @@ export function createEnforcePrivileged2FA(
 ): (req: Request, res: Response, next: NextFunction) => void {
   return function enforcePrivileged2FA(req, res, next) {
     (async () => {
-      const path = req.path;
-      if (!path.startsWith("/api/")) return next();
+        const path = req.path;
+        // Der organisationsübergreifende IBAN-Scan liegt bewusst außerhalb von
+        // /api, weil dieses Präfix im Artifact-Router dem separaten API-Service
+        // gehört. Er bleibt dennoch wie jede privilegierte API-Route 2FA-pflichtig.
+        const isProtectedAdminDiagnostic = path === "/admin/security/plaintext-iban-scan";
+        if (!path.startsWith("/api/") && !isProtectedAdminDiagnostic) return next();
       if (TWO_FA_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return next();
 
       // Task #195: Abgelaufener/gefälschter Bearer-Token darf privilegierte Routen

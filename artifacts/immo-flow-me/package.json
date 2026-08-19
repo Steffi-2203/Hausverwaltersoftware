@@ -13,7 +13,7 @@
     "pretest:security": "cross-env ALLOW_TEST_DATA_CLEANUP=1 node --import=./node_modules/tsx/dist/esm/index.cjs scripts/cleanup-test-data.ts",
     "pretest:api-keys": "cross-env ALLOW_TEST_DATA_CLEANUP=1 node --import=./node_modules/tsx/dist/esm/index.cjs scripts/cleanup-test-data.ts",
     "test:cleanup-integration": "cross-env ALLOW_TEST_DATA_CLEANUP=1 node --import=./node_modules/tsx/dist/esm/index.cjs --test --test-force-exit tests/unit/cleanup-test-data-integration.test.ts",
-    "test:security": "cross-env ALLOW_TEST_DATA_CLEANUP=1 node --import=./node_modules/tsx/dist/esm/index.cjs --test tests/unit/api-key-management.test.ts tests/unit/api-key-brute-force.test.ts tests/unit/rls-fail-closed.test.ts tests/unit/rls-payment-allocations-cross-org.test.ts tests/unit/leases-rls.test.ts tests/unit/portal-access-rls.test.ts tests/unit/field-encryption.test.ts tests/unit/encryption-integration.test.ts tests/unit/plaintext-iban-guard.test.ts tests/unit/field-encryption-cross-org.test.ts",
+    "test:security": "cross-env ALLOW_TEST_DATA_CLEANUP=1 node --import=./node_modules/tsx/dist/esm/index.cjs --test tests/unit/api-key-management.test.ts tests/unit/api-key-brute-force.test.ts tests/unit/rls-fail-closed.test.ts tests/unit/rls-payment-allocations-cross-org.test.ts tests/unit/leases-rls.test.ts tests/unit/portal-access-rls.test.ts tests/unit/field-encryption.test.ts tests/unit/encryption-integration.test.ts tests/unit/plaintext-iban-guard.test.ts tests/unit/plaintext-iban-guard-routes.test.ts tests/unit/field-encryption-cross-org.test.ts",
     "build:dev": "vite build --mode development",
     "start": "cross-env NODE_ENV=production tsx server/index.ts",
     "lint": "eslint .",

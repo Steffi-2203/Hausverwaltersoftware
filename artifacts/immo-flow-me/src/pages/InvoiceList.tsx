@@ -290,7 +290,10 @@ export default function InvoiceList() {
     paid: filteredInvoices?.filter(i => i.status === 'bezahlt').length || 0,
     overdue: filteredInvoices?.filter(i => i.status === 'ueberfaellig').length || 0,
     totalAmount: filteredInvoices?.reduce((sum, i) => sum + Number(i.gesamtbetrag), 0) || 0,
-    openAmount: filteredInvoices?.filter(i => i.status !== 'bezahlt').reduce((sum, i) => sum + Number(i.gesamtbetrag), 0) || 0,
+    openAmount: filteredInvoices?.filter(i => i.status !== 'bezahlt').reduce(
+      (sum, i) => sum + Number(i.gesamtbetrag) - (i.status === 'teilbezahlt' ? Number(i.paidAmount || 0) : 0),
+      0,
+    ) || 0,
   };
 
   const years = Array.from({ length: 5 }, (_, i) => now.getFullYear() - i);

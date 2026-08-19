@@ -25,55 +25,28 @@ import assert from "node:assert/strict";
 import { sql } from "drizzle-orm";
 import { rootDb } from "../../server/db";
 import {
+  EXPECTED_IBAN_TABLES,
+  IBAN_SQL_REGEX,
+  scanPlaintextIbanBic,
+  type ColumnRef,
+  type PlaintextIbanScanResult,
+} from "../../server/lib/plaintextIbanGuard";
+import {
   acquireEncryptionTestLock,
   releaseEncryptionTestLock,
 } from "../helpers/encryptionTestLock";
 
-// Bekannte Tabellen aus server/lib/migrateFieldEncryption.ts — Mindestabdeckung
-const EXPECTED_TABLES = [
-  "bank_accounts",
-  "tenants",
-  "owners",
-  "organizations",
-  "contractors",
-  "ebics_connections",
-  "transactions",
-  "kautionen",
-];
-
-// Klartext-Muster: IBAN (Ländercode + Prüfziffer + 11–30 alphanumerisch),
-// optional mit Leerzeichen gruppiert.
-const IBAN_SQL_REGEX = "^[A-Z]{2}[0-9]{2}[A-Z0-9 ]{11,34}$";
-// BIC: 4 Buchstaben Bank, 2 Buchstaben Land, 2 alphanum. Ort, optional 3 Filiale
-const BIC_SQL_REGEX = "^[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?$";
-
-type ColumnRef = { table: string; column: string };
-
 describe("Klartext-IBAN-Wächter: keine unverschlüsselten IBAN/BIC-Werte in der DB", () => {
   let ibanColumns: ColumnRef[] = [];
   let bicColumns: ColumnRef[] = [];
+  let scanResult: PlaintextIbanScanResult;
 
   before(async () => {
     await acquireEncryptionTestLock();
 
-    const result = await rootDb.execute(sql`
-      SELECT c.table_name, c.column_name
-      FROM information_schema.columns c
-      JOIN information_schema.tables t
-        ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-      WHERE c.table_schema = 'public'
-        AND t.table_type = 'BASE TABLE'
-        AND c.data_type IN ('text', 'character varying')
-        AND (c.column_name ILIKE '%iban%' OR c.column_name = 'bic')
-      ORDER BY c.table_name, c.column_name
-    `);
-    const rows = (result as any).rows as { table_name: string; column_name: string }[];
-    ibanColumns = rows
-      .filter((r) => r.column_name.toLowerCase().includes("iban"))
-      .map((r) => ({ table: r.table_name, column: r.column_name }));
-    bicColumns = rows
-      .filter((r) => r.column_name === "bic")
-      .map((r) => ({ table: r.table_name, column: r.column_name }));
+    scanResult = await scanPlaintextIbanBic(rootDb);
+    ibanColumns = scanResult.ibanColumns;
+    bicColumns = scanResult.bicColumns;
   });
 
   after(async () => {
@@ -82,35 +55,20 @@ describe("Klartext-IBAN-Wächter: keine unverschlüsselten IBAN/BIC-Werte in der
 
   it("Discovery findet alle bekannten IBAN-Tabellen (Schutz gegen stille Discovery-Brüche)", () => {
     const foundTables = new Set(ibanColumns.map((c) => c.table));
-    for (const t of EXPECTED_TABLES) {
+    for (const t of EXPECTED_IBAN_TABLES) {
       assert.ok(
         foundTables.has(t),
         `Tabelle '${t}' mit IBAN-Spalte wurde nicht entdeckt — information_schema-Abfrage prüfen`,
       );
     }
     // Mindestens die bekannten 8 Tabellen; neue Tabellen kommen automatisch dazu
-    assert.ok(ibanColumns.length >= EXPECTED_TABLES.length);
+    assert.ok(ibanColumns.length >= EXPECTED_IBAN_TABLES.length);
   });
 
-  it("keine Klartext-IBAN in irgendeiner IBAN-Spalte (enc:v1:-Präfix fehlt)", async () => {
-    const violations: string[] = [];
-    for (const { table, column } of ibanColumns) {
-      const res = await rootDb.execute(sql`
-        SELECT id::text AS id, ${sql.identifier(column)} AS val
-        FROM ${sql.identifier(table)}
-        WHERE ${sql.identifier(column)} IS NOT NULL
-          AND ${sql.identifier(column)} <> ''
-          AND ${sql.identifier(column)} NOT LIKE 'enc:v1:%'
-          AND upper(replace(${sql.identifier(column)}, ' ', '')) ~ ${IBAN_SQL_REGEX}
-        LIMIT 20
-      `);
-      const rows = (res as any).rows as { id: string; val: string }[];
-      for (const r of rows) {
-        violations.push(
-          `${table}.${column} id=${r.id}: Klartext-IBAN beginnend mit '${String(r.val).slice(0, 4)}…'`,
-        );
-      }
-    }
+  it("keine Klartext-IBAN in irgendeiner IBAN-Spalte (enc:v1:-Präfix fehlt)", () => {
+    const violations = scanResult.violations
+      .filter((violation) => violation.kind === "iban")
+      .map((violation) => `${violation.table}.${violation.column}: ${violation.count} Treffer (IDs: ${violation.ids.join(", ")})`);
     assert.deepEqual(
       violations,
       [],
@@ -118,23 +76,10 @@ describe("Klartext-IBAN-Wächter: keine unverschlüsselten IBAN/BIC-Werte in der
     );
   });
 
-  it("kein Klartext-BIC in irgendeiner bic-Spalte", async () => {
-    const violations: string[] = [];
-    for (const { table, column } of bicColumns) {
-      const res = await rootDb.execute(sql`
-        SELECT id::text AS id
-        FROM ${sql.identifier(table)}
-        WHERE ${sql.identifier(column)} IS NOT NULL
-          AND ${sql.identifier(column)} <> ''
-          AND ${sql.identifier(column)} NOT LIKE 'enc:v1:%'
-          AND upper(replace(${sql.identifier(column)}, ' ', '')) ~ ${BIC_SQL_REGEX}
-        LIMIT 20
-      `);
-      const rows = (res as any).rows as { id: string }[];
-      for (const r of rows) {
-        violations.push(`${table}.${column} id=${r.id}: Klartext-BIC`);
-      }
-    }
+  it("kein Klartext-BIC in irgendeiner bic-Spalte", () => {
+    const violations = scanResult.violations
+      .filter((violation) => violation.kind === "bic")
+      .map((violation) => `${violation.table}.${violation.column}: ${violation.count} Treffer (IDs: ${violation.ids.join(", ")})`);
     assert.deepEqual(
       violations,
       [],
