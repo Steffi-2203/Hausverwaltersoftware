@@ -2,6 +2,7 @@ import { db } from "../db";
 import { eq, and, sql, between } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { roundMoney } from "@shared/utils";
+import { toCents, fromCents, sumCents } from "../lib/money";
 
 interface AccountBalance {
   kontoNummer: string;
@@ -84,14 +85,19 @@ export async function validateTrialBalance(
   `);
 
   const row = (totalsResult.rows || totalsResult)[0] as any;
-  const totalSoll = roundMoney(Number(row.total_soll || 0));
-  const totalHaben = roundMoney(Number(row.total_haben || 0));
-  const difference = roundMoney(totalSoll - totalHaben);
+  // Intern in Cents rechnen — Float-Akkumulation vermieden
+  const totalSollCents = toCents(String(row.total_soll || 0));
+  const totalHabenCents = toCents(String(row.total_haben || 0));
+  const differenceCents = totalSollCents - totalHabenCents;
+  const totalSoll = fromCents(totalSollCents);
+  const totalHaben = fromCents(totalHabenCents);
+  const difference = fromCents(differenceCents);
   const entryCount = Number(row.entry_count || 0);
 
   const warnings: string[] = [];
 
-  if (Math.abs(difference) > 0.01) {
+  // Schwelle: 1 Cent (statt 0.01 Float-Vergleich)
+  if (Math.abs(differenceCents) >= 1) {
     warnings.push(`Saldendifferenz: Soll ${totalSoll.toFixed(2)} != Haben ${totalHaben.toFixed(2)}, Differenz: ${difference.toFixed(2)}`);
   }
 
@@ -105,7 +111,7 @@ export async function validateTrialBalance(
   }
 
   return {
-    isBalanced: Math.abs(difference) < 0.01,
+    isBalanced: Math.abs(differenceCents) < 1,
     totalSoll,
     totalHaben,
     difference,
@@ -142,21 +148,21 @@ export async function getAccountBalances(
   const rows: any[] = result.rows || result;
 
   return rows.map((r) => {
-    const totalSoll = roundMoney(Number(r.total_soll || 0));
-    const totalHaben = roundMoney(Number(r.total_haben || 0));
+    const totalSollCents = toCents(String(r.total_soll || 0));
+    const totalHabenCents = toCents(String(r.total_haben || 0));
     const accountType = r.account_type as string;
     const isPassive = accountType === "liability" || accountType === "equity" || accountType === "revenue";
-    const saldo = isPassive
-      ? roundMoney(totalHaben - totalSoll)
-      : roundMoney(totalSoll - totalHaben);
+    const saldoCents = isPassive
+      ? totalHabenCents - totalSollCents
+      : totalSollCents - totalHabenCents;
 
     return {
       kontoNummer: r.konto_nummer,
       kontoName: r.konto_name,
       accountType,
-      totalSoll,
-      totalHaben,
-      saldo,
+      totalSoll: fromCents(totalSollCents),
+      totalHaben: fromCents(totalHabenCents),
+      saldo: fromCents(saldoCents),
     };
   });
 }
@@ -177,23 +183,20 @@ export async function validateSettlementTotals(settlementId: string): Promise<Se
     .from(schema.wegSettlementDetails)
     .where(eq(schema.wegSettlementDetails.settlementId, settlementId));
 
-  const totalSoll = roundMoney(
-    details.reduce((sum, d) => sum + Number(d.totalSoll || 0), 0)
-  );
-  const totalIst = roundMoney(
-    details.reduce((sum, d) => sum + Number(d.totalIst || 0), 0)
-  );
-  const expenseTotal = roundMoney(Number(settlement.totalExpenses || 0));
+  // Float-Akkumulation durch Cent-Summen ersetzt
+  const totalSollCents = sumCents(details.map((d) => toCents(d.totalSoll || 0)));
+  const totalIstCents = sumCents(details.map((d) => toCents(d.totalIst || 0)));
+  const expenseTotalCents = toCents(settlement.totalExpenses || 0);
 
-  const discrepancy = roundMoney(Math.abs(totalSoll - expenseTotal));
-  const isValid = discrepancy < 0.01;
+  const discrepancyCents = Math.abs(totalSollCents - expenseTotalCents);
+  const isValid = discrepancyCents < 1;
 
   return {
     isValid,
-    totalSoll,
-    totalIst,
-    expenseTotal,
-    discrepancy,
+    totalSoll: fromCents(totalSollCents),
+    totalIst: fromCents(totalIstCents),
+    expenseTotal: fromCents(expenseTotalCents),
+    discrepancy: fromCents(discrepancyCents),
   };
 }
 
@@ -261,13 +264,18 @@ export async function getReconciliationRate(
   `);
 
   const payRow = (paymentResult.rows || paymentResult)[0] as any;
-  const totalPaymentAmount = roundMoney(Number(payRow.total_payment_amount || 0));
-  const allocatedAmount = roundMoney(Number(payRow.allocated_amount || 0));
+  // Einzel-DB-Werte in Cents überführen
+  const totalPaymentAmountCents = toCents(String(payRow.total_payment_amount || 0));
+  const allocatedAmountCents = toCents(String(payRow.allocated_amount || 0));
+  const totalPaymentAmount = fromCents(totalPaymentAmountCents);
+  const allocatedAmount = fromCents(allocatedAmountCents);
   const unmatchedPayments = Number(payRow.unmatched_payments || 0);
 
   const unmatchedInvoices = totalInvoices - paidInvoices;
   const invoiceMatchRate = totalInvoices > 0 ? roundMoney((paidInvoices / totalInvoices) * 100) : 0;
-  const paymentMatchRate = totalPaymentAmount > 0 ? roundMoney((allocatedAmount / totalPaymentAmount) * 100) : 0;
+  const paymentMatchRate = totalPaymentAmountCents > 0
+    ? roundMoney((allocatedAmountCents / totalPaymentAmountCents) * 100)
+    : 0;
 
   return {
     invoiceMatchRate,
@@ -304,14 +312,14 @@ export async function runDailyChecks(orgId: string): Promise<string[]> {
     JOIN journal_entry_lines jel ON jel.journal_entry_id = je.id
     WHERE je.organization_id = ${orgId}
     GROUP BY je.id, je.booking_number, je.description, je.entry_date
-    HAVING ABS(COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0)) > 0.01
+    HAVING ABS(COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0)) >= 0.005
     ORDER BY je.entry_date DESC
     LIMIT 50
   `);
 
   const unbalancedRows: any[] = unbalancedResult.rows || unbalancedResult;
   for (const row of unbalancedRows) {
-    const diff = roundMoney(Number(row.total_debit) - Number(row.total_credit));
+    const diff = fromCents(toCents(String(row.total_debit || 0)) - toCents(String(row.total_credit || 0)));
     warnings.push(
       `Unausgeglichene Buchung ${row.booking_number} (${row.entry_date}): Soll ${Number(row.total_debit).toFixed(2)} / Haben ${Number(row.total_credit).toFixed(2)}, Differenz ${diff.toFixed(2)}`
     );
@@ -328,7 +336,7 @@ export async function runDailyChecks(orgId: string): Promise<string[]> {
     WHERE je.organization_id = ${orgId}
       AND coa.account_type = 'asset'
     GROUP BY coa.id, coa.account_number, coa.name
-    HAVING COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0) < -0.01
+    HAVING COALESCE(SUM(jel.debit), 0) - COALESCE(SUM(jel.credit), 0) <= -0.005
   `);
 
   const negRows: any[] = negativeAssets.rows || negativeAssets;

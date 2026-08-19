@@ -2,6 +2,7 @@ import { db } from "../db";
 import { eq, and, sql, asc } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { roundMoney } from "@shared/utils";
+import { toCents, fromCents, roundHalfAwayFromZero } from "../lib/money";
 
 interface ComponentAllocation {
   miete: number;
@@ -42,7 +43,8 @@ export async function splitPaymentByPriority(
   tenantId: string,
   orgId: string
 ): Promise<SplitResult> {
-  let remaining = roundMoney(paymentAmount);
+  // Intern in Integer-Cents rechnen — Float-Akkumulation in der Prioritätsschleife vermieden
+  let remainingCents = toCents(paymentAmount);
   const allocations: InvoiceAllocation[] = [];
 
   const invoices = await db.execute(sql`
@@ -60,62 +62,76 @@ export async function splitPaymentByPriority(
   const invoiceRows: any[] = invoices.rows || invoices;
 
   for (const inv of invoiceRows) {
-    if (remaining <= 0) break;
+    if (remainingCents <= 0) break;
 
     const existingAllocations = await db.execute(sql`
       SELECT COALESCE(SUM(applied_amount::numeric), 0) AS already_paid
       FROM payment_allocations
       WHERE invoice_id = ${inv.id}
     `);
-    const alreadyPaid = roundMoney(Number(((existingAllocations.rows || existingAllocations)[0] as any).already_paid || 0));
+    const alreadyPaidCents = toCents(String(((existingAllocations.rows || existingAllocations)[0] as any).already_paid || 0));
 
-    const grundmiete = roundMoney(Number(inv.grundmiete || 0));
-    const bk = roundMoney(Number(inv.betriebskosten || 0));
-    const hk = roundMoney(Number(inv.heizungskosten || 0));
-    const wk = roundMoney(Number(inv.wasserkosten || 0));
-    const ust = roundMoney(Number(inv.ust || 0));
-    const total = roundMoney(Number(inv.gesamtbetrag || 0));
-    const invoiceDue = roundMoney(Math.max(0, total - alreadyPaid));
+    const grundmieteCents = toCents(inv.grundmiete || 0);
+    const bkCents = toCents(inv.betriebskosten || 0);
+    const hkCents = toCents(inv.heizungskosten || 0);
+    const wkCents = toCents(inv.wasserkosten || 0);
+    const ustCents = toCents(inv.ust || 0);
+    const totalCents = toCents(inv.gesamtbetrag || 0);
+    const invoiceDueCents = Math.max(0, totalCents - alreadyPaidCents);
 
-    if (invoiceDue <= 0) continue;
+    if (invoiceDueCents <= 0) continue;
 
-    const nettoTotal = roundMoney(grundmiete + bk + hk + wk);
-    const ustRatio = nettoTotal > 0 ? ust / nettoTotal : 0;
+    const nettoTotalCents = grundmieteCents + bkCents + hkCents + wkCents;
+    // USt- und Proporz-Berechnungen mit Integer-Zähler/Nenner statt vorberechneter Float-Quote:
+    // round(a * b / c) statt round(a * (b/c)) — vermeidet Verlust durch Zwischenrundung.
+    const denominatorCents = nettoTotalCents + ustCents; // Netto + USt = Bruttobasis
 
-    const components: ComponentAllocation = { miete: 0, bk: 0, hk: 0, wk: 0, ust: 0 };
-    let invoiceAllocated = 0;
+    // Komponenten intern in Cents
+    const componentsCents = { miete: 0, bk: 0, hk: 0, wk: 0, ust: 0 };
+    let invoiceAllocatedCents = 0;
 
-    const priorityItems: Array<{ key: keyof Omit<ComponentAllocation, 'ust'>; amount: number }> = [
-      { key: "miete", amount: grundmiete },
-      { key: "bk", amount: bk },
-      { key: "hk", amount: hk },
-      { key: "wk", amount: wk },
+    const priorityItems: Array<{ key: keyof Omit<ComponentAllocation, 'ust'>; amountCents: number }> = [
+      { key: "miete", amountCents: grundmieteCents },
+      { key: "bk", amountCents: bkCents },
+      { key: "hk", amountCents: hkCents },
+      { key: "wk", amountCents: wkCents },
     ];
 
-    let paidProportion = alreadyPaid > 0 ? alreadyPaid / total : 0;
+    // Unbezahlter Anteil als Integer-Zähler/Nenner: (totalCents - alreadyPaidCents) / totalCents
+    const unpaidNumerator = totalCents - alreadyPaidCents;
 
     for (const item of priorityItems) {
-      if (remaining <= 0) break;
+      if (remainingCents <= 0) break;
 
-      const componentDue = roundMoney(item.amount * (1 - paidProportion));
-      if (componentDue <= 0) continue;
+      // Komponenten-Anteil proportional zum noch offenen Rechnungsteil
+      const componentDueCents = totalCents > 0
+        ? roundHalfAwayFromZero(item.amountCents * unpaidNumerator / totalCents)
+        : 0;
+      if (componentDueCents <= 0) continue;
 
-      const componentUst = roundMoney(componentDue * ustRatio);
-      const componentTotal = roundMoney(componentDue + componentUst);
-      const apply = roundMoney(Math.min(remaining, componentTotal));
+      // USt auf diese Komponente: componentDue * ust / netto  (ganzzahlig gerundet)
+      const componentUstCents = nettoTotalCents > 0
+        ? roundHalfAwayFromZero(componentDueCents * ustCents / nettoTotalCents)
+        : 0;
+      const componentTotalCents = componentDueCents + componentUstCents;
+      const applyCents = Math.min(remainingCents, componentTotalCents);
 
-      const netApply = roundMoney(apply / (1 + ustRatio));
-      const ustApply = roundMoney(apply - netApply);
+      // Netto-Anteil am angewandten Betrag: apply * netto / (netto + ust), Rest = USt
+      const netApplyCents = denominatorCents > 0
+        ? roundHalfAwayFromZero(applyCents * nettoTotalCents / denominatorCents)
+        : applyCents;
+      const ustApplyCents = applyCents - netApplyCents;
 
-      components[item.key] = roundMoney(components[item.key] + netApply);
-      components.ust = roundMoney(components.ust + ustApply);
-      invoiceAllocated = roundMoney(invoiceAllocated + apply);
-      remaining = roundMoney(remaining - apply);
+      componentsCents[item.key] += netApplyCents;
+      componentsCents.ust += ustApplyCents;
+      invoiceAllocatedCents += applyCents;
+      remainingCents -= applyCents;
     }
 
-    if (invoiceAllocated > 0) {
-      const newTotalPaid = roundMoney(alreadyPaid + invoiceAllocated);
-      const newStatus = newTotalPaid >= total ? "bezahlt" : "teilbezahlt";
+    if (invoiceAllocatedCents > 0) {
+      const newTotalPaidCents = alreadyPaidCents + invoiceAllocatedCents;
+      const newTotalPaid = fromCents(newTotalPaidCents);
+      const newStatus = newTotalPaidCents >= totalCents ? "bezahlt" : "teilbezahlt";
 
       await db.execute(sql`
         UPDATE monthly_invoices
@@ -127,18 +143,25 @@ export async function splitPaymentByPriority(
 
       allocations.push({
         invoiceId: inv.id,
-        allocatedAmount: invoiceAllocated,
-        components,
-        remaining: roundMoney(total - newTotalPaid),
+        allocatedAmount: fromCents(invoiceAllocatedCents),
+        components: {
+          miete: fromCents(componentsCents.miete),
+          bk: fromCents(componentsCents.bk),
+          hk: fromCents(componentsCents.hk),
+          wk: fromCents(componentsCents.wk),
+          ust: fromCents(componentsCents.ust),
+        },
+        remaining: fromCents(Math.max(0, totalCents - newTotalPaidCents)),
         status: newStatus,
       });
     }
   }
 
+  const paymentAmountCents = toCents(paymentAmount);
   return {
     allocations,
-    totalAllocated: roundMoney(paymentAmount - remaining),
-    remainingAmount: remaining,
+    totalAllocated: fromCents(paymentAmountCents - remainingCents),
+    remainingAmount: fromCents(remainingCents),
   };
 }
 
@@ -148,7 +171,9 @@ export async function allocatePaymentToInvoice(
   amount: number,
   orgId?: string
 ): Promise<any> {
-  const roundedAmount = roundMoney(amount);
+  // Intern in Cents — kein Float-Subtraktions-Drift bei Aggregat-Vergleich
+  const amountCents = toCents(amount);
+  const dbAmount = fromCents(amountCents); // kanonischer 2-Dezimal-String für die DB
 
   // Audit-Befund K2: Zugriffsprüfung ist Pflicht, nicht optional
   if (!orgId) {
@@ -182,19 +207,20 @@ export async function allocatePaymentToInvoice(
     .values({
       paymentId,
       invoiceId,
-      appliedAmount: String(roundedAmount),
+      appliedAmount: String(dbAmount),
       allocationType: "miete",
     })
     .returning();
 
+  // Aggregat-Summe aus der DB in Cents — kein Float-Vergleich mit roundMoney
   const totalAllocResult = await db.execute(sql`
     SELECT COALESCE(SUM(applied_amount::numeric), 0) AS total_allocated
     FROM payment_allocations
     WHERE invoice_id = ${invoiceId}
   `);
 
-  const totalAllocated = roundMoney(
-    Number(((totalAllocResult.rows || totalAllocResult)[0] as any).total_allocated || 0)
+  const totalAllocatedCents = toCents(
+    String(((totalAllocResult.rows || totalAllocResult)[0] as any).total_allocated || 0)
   );
 
   const [invoice] = await db
@@ -204,13 +230,17 @@ export async function allocatePaymentToInvoice(
     .limit(1);
 
   if (invoice) {
-    const total = roundMoney(Number(invoice.gesamtbetrag || 0));
-    const newStatus = totalAllocated >= total ? "bezahlt" : totalAllocated > 0 ? "teilbezahlt" : "offen";
+    const totalCents = toCents(invoice.gesamtbetrag || 0);
+    const newStatus = totalAllocatedCents >= totalCents
+      ? "bezahlt"
+      : totalAllocatedCents > 0
+      ? "teilbezahlt"
+      : "offen";
 
     await db.execute(sql`
       UPDATE monthly_invoices
       SET status = ${newStatus},
-          paid_amount = ${totalAllocated},
+          paid_amount = ${fromCents(totalAllocatedCents)},
           updated_at = NOW()
       WHERE id = ${invoiceId}
     `);
@@ -261,11 +291,12 @@ export async function autoMatchPayments(orgId: string): Promise<AutoMatchResult>
   const unallocated = await getUnallocatedPayments(orgId);
 
   for (const payment of unallocated) {
-    const paymentAmount = roundMoney(Number(payment.betrag || 0));
-    const allocatedTotal = roundMoney(Number(payment.allocated_total || 0));
-    const unallocatedAmount = roundMoney(paymentAmount - allocatedTotal);
+    // Alle Geldwerte intern als Integer-Cents — kein roundMoney/float-Subtraktions-Drift
+    const paymentCents = toCents(payment.betrag || 0);
+    const allocatedTotalCents = toCents(payment.allocated_total || 0);
+    const unallocatedCents = paymentCents - allocatedTotalCents;
 
-    if (unallocatedAmount <= 0) continue;
+    if (unallocatedCents <= 0) continue;
 
     const openInvoicesResult = await db.execute(sql`
       SELECT mi.*, COALESCE(pa_sum.allocated, 0) AS already_allocated
@@ -286,50 +317,53 @@ export async function autoMatchPayments(orgId: string): Promise<AutoMatchResult>
     let didMatch = false;
 
     for (const inv of openInvoices) {
-      const invTotal = roundMoney(Number(inv.gesamtbetrag || 0));
-      const invAllocated = roundMoney(Number(inv.already_allocated || 0));
-      const invDue = roundMoney(invTotal - invAllocated);
+      const invTotalCents = toCents(inv.gesamtbetrag || 0);
+      const invAllocatedCents = toCents(inv.already_allocated || 0);
+      const invDueCents = invTotalCents - invAllocatedCents;
 
-      if (invDue <= 0) continue;
+      if (invDueCents <= 0) continue;
 
-      if (Math.abs(unallocatedAmount - invDue) < 0.01) {
-        await allocatePaymentToInvoice(payment.id, inv.id, unallocatedAmount);
+      // Exakter Cent-Vergleich (< 1 Cent Toleranz)
+      if (Math.abs(unallocatedCents - invDueCents) < 1) {
+        await allocatePaymentToInvoice(payment.id, inv.id, fromCents(unallocatedCents), orgId);
         matched.push({
           paymentId: payment.id,
           invoiceId: inv.id,
-          amount: unallocatedAmount,
+          amount: fromCents(unallocatedCents),
           reason: "Exakte Betragsübereinstimmung",
         });
         didMatch = true;
         break;
       }
 
-      if (Math.abs(unallocatedAmount - invDue) < 1.0) {
+      // Nahe-Übereinstimmung: weniger als 1 € (100 Cent) Differenz
+      if (Math.abs(unallocatedCents - invDueCents) < 100) {
         suggestions.push({
           paymentId: payment.id,
           invoiceId: inv.id,
-          amount: invDue,
+          amount: fromCents(invDueCents),
           confidence: 80,
-          reason: `Betrag fast identisch (Differenz: ${roundMoney(Math.abs(unallocatedAmount - invDue)).toFixed(2)} EUR)`,
+          reason: `Betrag fast identisch (Differenz: ${fromCents(Math.abs(unallocatedCents - invDueCents)).toFixed(2)} EUR)`,
         });
       }
     }
 
     if (!didMatch && suggestions.filter((s) => s.paymentId === payment.id).length === 0) {
-      let totalDue = 0;
+      // Cent-Summe über alle offenen Rechnungen
+      let totalDueCents = 0;
       for (const inv of openInvoices) {
-        totalDue = roundMoney(totalDue + roundMoney(Number(inv.gesamtbetrag || 0) - Number(inv.already_allocated || 0)));
+        totalDueCents += toCents(inv.gesamtbetrag || 0) - toCents(inv.already_allocated || 0);
       }
 
-      if (totalDue > 0 && Math.abs(unallocatedAmount - totalDue) < 0.01) {
+      if (totalDueCents > 0 && Math.abs(unallocatedCents - totalDueCents) < 1) {
         for (const inv of openInvoices) {
-          const invDue = roundMoney(Number(inv.gesamtbetrag || 0) - Number(inv.already_allocated || 0));
-          if (invDue > 0) {
-            await allocatePaymentToInvoice(payment.id, inv.id, invDue);
+          const invDueCents = toCents(inv.gesamtbetrag || 0) - toCents(inv.already_allocated || 0);
+          if (invDueCents > 0) {
+            await allocatePaymentToInvoice(payment.id, inv.id, fromCents(invDueCents), orgId);
             matched.push({
               paymentId: payment.id,
               invoiceId: inv.id,
-              amount: invDue,
+              amount: fromCents(invDueCents),
               reason: "Summe aller offenen Rechnungen stimmt überein",
             });
           }

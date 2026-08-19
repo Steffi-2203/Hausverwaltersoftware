@@ -11,6 +11,7 @@ import { eq, and, inArray, gte, lte } from "drizzle-orm";
 import { writeAudit } from "../lib/auditLog";
 import type { Tenant } from "@shared/schema";
 import { roundMoney } from "@shared/utils";
+import { toCents, fromCents, sumCents, ustFromGrossCents } from "../lib/money";
 
 interface InvoiceLine {
   invoiceId: string;
@@ -102,30 +103,31 @@ export class InvoiceService {
         lte(payments.buchungsDatum, endDate)
       ));
 
-    const sollMiete = prevYearInvoices.reduce((s, inv) => s + Number(inv.grundmiete || 0), 0);
-    const sollBk = prevYearInvoices.reduce((s, inv) => s + Number(inv.betriebskosten || 0), 0);
-    const sollHk = prevYearInvoices.reduce((s, inv) => s + Number(inv.heizungskosten || 0), 0);
-    const sollGesamt = roundMoney(sollMiete + sollBk + sollHk);
+    // Float-Akkumulation durch Cent-Summen ersetzt
+    const sollMieteCents = sumCents(prevYearInvoices.map((inv) => toCents(inv.grundmiete || 0)));
+    const sollBkCents = sumCents(prevYearInvoices.map((inv) => toCents(inv.betriebskosten || 0)));
+    const sollHkCents = sumCents(prevYearInvoices.map((inv) => toCents(inv.heizungskosten || 0)));
+    const sollGesamtCents = sollMieteCents + sollBkCents + sollHkCents;
 
-    const istGesamt = roundMoney(prevYearPayments.reduce((s, p) => s + Number(p.betrag || 0), 0));
-    const diff = roundMoney(istGesamt - sollGesamt);
+    const istGesamtCents = sumCents(prevYearPayments.map((p) => toCents(p.betrag || 0)));
+    const diffCents = istGesamtCents - sollGesamtCents;
 
-    if (diff > 0) {
-      return { vortragMiete: 0, vortragBk: 0, vortragHk: 0, vortragSonstige: 0, credit: diff };
+    if (diffCents > 0) {
+      return { vortragMiete: 0, vortragBk: 0, vortragHk: 0, vortragSonstige: 0, credit: fromCents(diffCents) };
     }
 
-    let remainingPayment = istGesamt;
-    const paidBk = Math.min(remainingPayment, sollBk);
-    remainingPayment = roundMoney(remainingPayment - paidBk);
-    const paidHk = Math.min(remainingPayment, sollHk);
-    remainingPayment = roundMoney(remainingPayment - paidHk);
-    const paidMiete = Math.min(remainingPayment, sollMiete);
-    remainingPayment = roundMoney(remainingPayment - paidMiete);
+    let remainingCents = istGesamtCents;
+    const paidBkCents = Math.min(remainingCents, sollBkCents);
+    remainingCents -= paidBkCents;
+    const paidHkCents = Math.min(remainingCents, sollHkCents);
+    remainingCents -= paidHkCents;
+    const paidMieteCents = Math.min(remainingCents, sollMieteCents);
+    remainingCents -= paidMieteCents;
 
     return {
-      vortragMiete: roundMoney(Math.max(0, sollMiete - paidMiete)),
-      vortragBk: roundMoney(Math.max(0, sollBk - paidBk)),
-      vortragHk: roundMoney(Math.max(0, sollHk - paidHk)),
+      vortragMiete: fromCents(Math.max(0, sollMieteCents - paidMieteCents)),
+      vortragBk: fromCents(Math.max(0, sollBkCents - paidBkCents)),
+      vortragHk: fromCents(Math.max(0, sollHkCents - paidHkCents)),
       vortragSonstige: 0,
     };
   }
@@ -140,39 +142,40 @@ export class InvoiceService {
   ): InvoiceData {
     const vatRates = this.getVatRates(unitType);
     
-    const grundmiete = roundMoney(Number(tenant.grundmiete) || 0);
-    const betriebskosten = roundMoney(Number(tenant.betriebskostenVorschuss) || 0);
-    const heizungskosten = roundMoney(Number(tenant.heizkostenVorschuss) || 0);
-    
-    const ustMiete = roundMoney(this.calculateVatFromGross(grundmiete, vatRates.ustSatzMiete));
-    const ustBk = roundMoney(this.calculateVatFromGross(betriebskosten, vatRates.ustSatzBk));
-    const ustHeizung = roundMoney(this.calculateVatFromGross(heizungskosten, vatRates.ustSatzHeizung));
-    const ust = roundMoney(ustMiete + ustBk + ustHeizung);
+    // Float-Arithmetik durch Cent-basierte Berechnung ersetzt
+    const grundmieteCents = toCents(Number(tenant.grundmiete) || 0);
+    const betriebskostenCents = toCents(Number(tenant.betriebskostenVorschuss) || 0);
+    const heizungskostenCents = toCents(Number(tenant.heizkostenVorschuss) || 0);
 
-    const vortragGesamt = roundMoney(carryForward.vortragMiete + carryForward.vortragBk + 
-                         carryForward.vortragHk + carryForward.vortragSonstige);
-    
-    const gesamtbetrag = roundMoney(grundmiete + betriebskosten + heizungskosten + vortragGesamt);
+    const ustMieteCents = ustFromGrossCents(grundmieteCents, vatRates.ustSatzMiete);
+    const ustBkCents = ustFromGrossCents(betriebskostenCents, vatRates.ustSatzBk);
+    const ustHeizungCents = ustFromGrossCents(heizungskostenCents, vatRates.ustSatzHeizung);
+    const ustCents = ustMieteCents + ustBkCents + ustHeizungCents;
+
+    const vortragGesamtCents = toCents(carryForward.vortragMiete) + toCents(carryForward.vortragBk) +
+                               toCents(carryForward.vortragHk) + toCents(carryForward.vortragSonstige);
+
+    const gesamtbetragCents = grundmieteCents + betriebskostenCents + heizungskostenCents + vortragGesamtCents;
 
     return {
       tenantId: tenant.id,
       unitId: tenant.unitId,
       year,
       month,
-      grundmiete,
-      betriebskosten,
-      heizungskosten,
-      gesamtbetrag,
-      ust,
+      grundmiete: fromCents(grundmieteCents),
+      betriebskosten: fromCents(betriebskostenCents),
+      heizungskosten: fromCents(heizungskostenCents),
+      gesamtbetrag: fromCents(gesamtbetragCents),
+      ust: fromCents(ustCents),
       ustSatzMiete: vatRates.ustSatzMiete,
       ustSatzBk: vatRates.ustSatzBk,
       ustSatzHeizung: vatRates.ustSatzHeizung,
       status: "offen",
       faelligAm: dueDate,
-      vortragMiete: roundMoney(carryForward.vortragMiete),
-      vortragBk: roundMoney(carryForward.vortragBk),
-      vortragHk: roundMoney(carryForward.vortragHk),
-      vortragSonstige: roundMoney(carryForward.vortragSonstige),
+      vortragMiete: fromCents(toCents(carryForward.vortragMiete)),
+      vortragBk: fromCents(toCents(carryForward.vortragBk)),
+      vortragHk: fromCents(toCents(carryForward.vortragHk)),
+      vortragSonstige: fromCents(toCents(carryForward.vortragSonstige)),
     };
   }
 
@@ -584,13 +587,14 @@ export class InvoiceService {
         lte(payments.buchungsDatum, endDate)
       ));
 
-    const totalSoll = yearInvoices.reduce((sum, inv) => sum + Number(inv.gesamtbetrag || 0), 0);
-    const totalIst = yearPayments.reduce((sum, p) => sum + Number(p.betrag || 0), 0);
+    // Float-Akkumulation durch Cent-Summen ersetzt
+    const totalSollCents = sumCents(yearInvoices.map((inv) => toCents(inv.gesamtbetrag || 0)));
+    const totalIstCents = sumCents(yearPayments.map((p) => toCents(p.betrag || 0)));
 
     return {
-      totalSoll: roundMoney(totalSoll),
-      totalIst: roundMoney(totalIst),
-      saldo: roundMoney(totalSoll - totalIst),
+      totalSoll: fromCents(totalSollCents),
+      totalIst: fromCents(totalIstCents),
+      saldo: fromCents(totalSollCents - totalIstCents),
       invoiceCount: yearInvoices.length
     };
   }
