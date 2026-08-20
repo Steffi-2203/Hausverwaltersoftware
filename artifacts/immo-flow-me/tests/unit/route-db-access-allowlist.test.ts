@@ -39,9 +39,9 @@ const ROUTE_DB_ACCESS_ALLOWLIST: readonly AllowlistedAccess[] = [
     file: "auth.ts",
     imported: "rootDb",
     local: "db",
-    expectedReferences: 44,
+    expectedReferences: 46,
     reason:
-      "Der zentrale Login-, Passwort- und Session-Bootstrap verarbeitet Auth-Tabellen vor einem Organisationskontext; alle Organisationsdaten werden daraus erst nach erfolgreicher Authentifizierung abgeleitet.",
+      "Der zentrale Login-, Passwort- und Session-Bootstrap verarbeitet Auth-Tabellen vor einem Organisationskontext; die Magic-Login-2FA-Prüfung liest nur den eingelösten Nutzer, bevor eine Vollsession entsteht.",
   },
   {
     file: "helpers.ts",

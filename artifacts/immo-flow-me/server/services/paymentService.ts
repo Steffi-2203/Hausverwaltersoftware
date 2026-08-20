@@ -13,6 +13,11 @@ import {
 import { eq, and, gte, lte, desc, or, inArray, sql } from "drizzle-orm";
 import { roundMoney } from "@shared/utils";
 import { verifyTenantOwnership } from "../lib/ownershipCheck";
+import {
+  getDunningChargesByInvoice,
+  getEffectiveInvoiceTotal,
+  getOutstandingInvoiceAmount,
+} from "./invoiceTotalsService";
 
 interface DunningLevel {
   level: 1 | 2 | 3;
@@ -77,13 +82,19 @@ export class PaymentService {
       // unit_id → property zur Organisation gehören — bei inkonsistenten
       // Daten (Tenant und Invoice-Unit in verschiedenen Orgs) fail-closed.
       const invoices = await tx.execute(sql`
-        SELECT mi.id, mi.gesamtbetrag, COALESCE(mi.paid_amount, 0) AS paid_amount
+        SELECT mi.id, mi.gesamtbetrag, COALESCE(mi.paid_amount, 0) AS paid_amount,
+          COALESCE((
+            SELECT SUM(il.amount::numeric)
+            FROM invoice_lines il
+            WHERE il.invoice_id = mi.id
+              AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+          ), 0) AS dunning_charges
         FROM monthly_invoices mi
         JOIN units u ON mi.unit_id = u.id
         JOIN properties p ON u.property_id = p.id
         WHERE mi.tenant_id = ${tenantId}
           AND p.organization_id = ${organizationId}
-          AND mi.status IN ('offen','teilbezahlt')
+          AND mi.status IN ('offen','teilbezahlt','ueberfaellig')
         ORDER BY mi.year, mi.month
         FOR UPDATE OF mi
       `).then(r => r.rows);
@@ -94,7 +105,10 @@ export class PaymentService {
       for (const inv of invoices) {
         if (remaining <= 0) break;
 
-        const total = roundMoney(Number(inv.gesamtbetrag || 0));
+        const total = getEffectiveInvoiceTotal(
+          inv.gesamtbetrag,
+          Number(inv.dunning_charges || 0),
+        );
         const paid = roundMoney(Number(inv.paid_amount || 0));
         const due = roundMoney(total - paid);
         if (due <= 0) continue;
@@ -198,9 +212,16 @@ export class PaymentService {
   async getTenantBalance(tenantId: string, year?: number) {
     const whereYear = year ? sql`AND year = ${year}` : sql``;
     const result = await db.execute(sql`
-      SELECT COALESCE(SUM(gesamtbetrag),0) AS total_soll, COALESCE(SUM(paid_amount),0) AS total_ist
-      FROM monthly_invoices
-      WHERE tenant_id = ${tenantId} ${whereYear}
+      SELECT
+        COALESCE(SUM(mi.gesamtbetrag::numeric + COALESCE((
+          SELECT SUM(il.amount::numeric)
+          FROM invoice_lines il
+          WHERE il.invoice_id = mi.id
+            AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+        ), 0)), 0) AS total_soll,
+        COALESCE(SUM(mi.paid_amount), 0) AS total_ist
+      FROM monthly_invoices mi
+      WHERE mi.tenant_id = ${tenantId} ${whereYear}
     `).then(r => r.rows[0]);
 
     const totalSoll = roundMoney(Number(result?.total_soll || 0));
@@ -348,6 +369,9 @@ export class PaymentService {
         )
         .orderBy(monthlyInvoices.year, monthlyInvoices.month);
 
+      const dunningChargesByInvoice = await getDunningChargesByInvoice(
+        overdueInvoices.map((invoice) => invoice.id),
+      );
       const overdueDetails: DunningResult["overdueInvoices"] = [];
       let maxDaysOverdue = 0;
       let totalOutstanding = 0;
@@ -361,9 +385,11 @@ export class PaymentService {
         );
 
         if (daysOverdue >= minDaysOverdue) {
-          const invoiceTotal = Number(invoice.gesamtbetrag) || 0;
-          const paidAmount = Number((invoice as any).paidAmount ?? 0);
-          const outstanding = roundMoney(invoiceTotal - paidAmount);
+          const outstanding = getOutstandingInvoiceAmount(
+            invoice.gesamtbetrag,
+            invoice.paidAmount,
+            dunningChargesByInvoice.get(invoice.id) || 0,
+          );
 
           if (outstanding > 0) {
             overdueDetails.push({

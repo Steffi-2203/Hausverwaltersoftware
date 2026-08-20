@@ -50,3 +50,13 @@ description: Startup quirks, schema decisions, and security hardening lessons fo
 
 ## SQL-Migrations-Splitter
 Der eigene Splitter in `runSqlMigrations` splittet auf `;` — er muss String-Literale ('' Escapes, E-Strings, "..."-Identifier, $tag$-Dollar-Quotes) und Kommentare lexikalisch tracken, sonst crasht ein `;` in einem COMMENT-Text den Produktions-Boot (passiert Aug 2026). Regressionstests: tests/unit/sql-migration-splitter.test.ts. Deploy-Failure-Muster: Build grün, Promote scheitert mit Healthcheck 500 → fetchDeploymentLogs zeigt den Migrationsfehler.
+
+## Legacy-Schlüssel auf Organisationen zurückführen
+**Rule:** Bevor ein zuvor globaler Datensatz eine Organisation erhält, müssen bereits vorhandene org-spezifische Datensätze mit demselben Unique-Schlüssel geprüft werden. Bei Kollisionen FK-Referenzen auf den passenden Datensatz umhängen, statt den Legacy-Datensatz zu aktualisieren.
+**Why:** Ein `NOT NULL`-Backfill kann am org-weiten Unique-Index scheitern oder bei Alt-Referenzen mehrerer Organisationen einen Schlüssel der falschen Organisation zuordnen.
+**How to apply:** Ursprüngliche NULL-Zeilen während der Migration markieren, alle FK-Pfade gegen ihre tatsächliche Organisation prüfen und gleichartige Ersatzzeilen bevorzugen. Sind Referenzen nicht semantisch sicher auflösbar, die atomare Migration vor Änderungen abbrechen — nie bestehende Beziehungen nur wegen eines optionalen FK stillschweigend löschen.
+
+## SQL-Migrationen: Transaktionsbesitz
+**Rule:** Der Runner darf nur Dateien ohne eigene Top-Level-Transaktionsbefehle umschließen. Dateien mit eigenem `BEGIN`/`COMMIT` bleiben dafür verantwortlich und werden innerhalb ihrer Transaktion statementweise per Savepoint abgesichert.
+**Why:** Verschachtelte `BEGIN`-Aufrufe lassen frische Deploys vor späteren Migrationen abbrechen; vollständig ungeschützte Dateien hinterlassen bei Fehlern Teilzustände.
+**How to apply:** Neue Migrationen ohne explizite Transaktionsbefehle schreiben; der Runner macht sie pro Datei atomar. Bei alten Dateien mit Top-Level-Transaktionssteuerung die Erkennung und den realen Kompatibilitätstest beibehalten.

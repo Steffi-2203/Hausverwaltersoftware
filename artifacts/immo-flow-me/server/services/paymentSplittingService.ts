@@ -3,6 +3,7 @@ import { eq, and, sql, asc } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { roundMoney } from "@shared/utils";
 import { toCents, fromCents, roundHalfAwayFromZero } from "../lib/money";
+import { getDunningChargesByInvoice, getEffectiveInvoiceTotal } from "./invoiceTotalsService";
 
 interface ComponentAllocation {
   miete: number;
@@ -48,7 +49,13 @@ export async function splitPaymentByPriority(
   const allocations: InvoiceAllocation[] = [];
 
   const invoices = await db.execute(sql`
-    SELECT mi.*
+    SELECT mi.*,
+      COALESCE((
+        SELECT SUM(il.amount::numeric)
+        FROM invoice_lines il
+        WHERE il.invoice_id = mi.id
+          AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+      ), 0) AS dunning_charges
     FROM monthly_invoices mi
     JOIN units u ON u.id = mi.unit_id
     JOIN properties p ON p.id = u.property_id
@@ -76,7 +83,8 @@ export async function splitPaymentByPriority(
     const hkCents = toCents(inv.heizungskosten || 0);
     const wkCents = toCents(inv.wasserkosten || 0);
     const ustCents = toCents(inv.ust || 0);
-    const totalCents = toCents(inv.gesamtbetrag || 0);
+    const headerTotalCents = toCents(inv.gesamtbetrag || 0);
+    const totalCents = toCents(getEffectiveInvoiceTotal(inv.gesamtbetrag, Number(inv.dunning_charges || 0)));
     const invoiceDueCents = Math.max(0, totalCents - alreadyPaidCents);
 
     if (invoiceDueCents <= 0) continue;
@@ -98,14 +106,14 @@ export async function splitPaymentByPriority(
     ];
 
     // Unbezahlter Anteil als Integer-Zähler/Nenner: (totalCents - alreadyPaidCents) / totalCents
-    const unpaidNumerator = totalCents - alreadyPaidCents;
+    const unpaidNumerator = Math.max(0, headerTotalCents - alreadyPaidCents);
 
     for (const item of priorityItems) {
       if (remainingCents <= 0) break;
 
       // Komponenten-Anteil proportional zum noch offenen Rechnungsteil
-      const componentDueCents = totalCents > 0
-        ? roundHalfAwayFromZero(item.amountCents * unpaidNumerator / totalCents)
+      const componentDueCents = headerTotalCents > 0
+        ? roundHalfAwayFromZero(item.amountCents * unpaidNumerator / headerTotalCents)
         : 0;
       if (componentDueCents <= 0) continue;
 
@@ -127,6 +135,16 @@ export async function splitPaymentByPriority(
       invoiceAllocatedCents += applyCents;
       remainingCents -= applyCents;
     }
+
+    // Dunning charges have no rent/VAT component but are still part of the
+    // receivable. They are paid only after the original invoice components.
+    const surchargeDueCents = Math.max(
+      0,
+      totalCents - alreadyPaidCents - invoiceAllocatedCents,
+    );
+    const surchargePaymentCents = Math.min(remainingCents, surchargeDueCents);
+    invoiceAllocatedCents += surchargePaymentCents;
+    remainingCents -= surchargePaymentCents;
 
     if (invoiceAllocatedCents > 0) {
       const newTotalPaidCents = alreadyPaidCents + invoiceAllocatedCents;
@@ -230,7 +248,10 @@ export async function allocatePaymentToInvoice(
     .limit(1);
 
   if (invoice) {
-    const totalCents = toCents(invoice.gesamtbetrag || 0);
+    const dunningCharges = await getDunningChargesByInvoice([invoiceId]);
+    const totalCents = toCents(
+      getEffectiveInvoiceTotal(invoice.gesamtbetrag, dunningCharges.get(invoiceId) || 0),
+    );
     const newStatus = totalAllocatedCents >= totalCents
       ? "bezahlt"
       : totalAllocatedCents > 0
@@ -299,7 +320,13 @@ export async function autoMatchPayments(orgId: string): Promise<AutoMatchResult>
     if (unallocatedCents <= 0) continue;
 
     const openInvoicesResult = await db.execute(sql`
-      SELECT mi.*, COALESCE(pa_sum.allocated, 0) AS already_allocated
+      SELECT mi.*, COALESCE(pa_sum.allocated, 0) AS already_allocated,
+        COALESCE((
+          SELECT SUM(il.amount::numeric)
+          FROM invoice_lines il
+          WHERE il.invoice_id = mi.id
+            AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+        ), 0) AS dunning_charges
       FROM monthly_invoices mi
       LEFT JOIN (
         SELECT invoice_id, SUM(applied_amount::numeric) AS allocated
@@ -317,7 +344,9 @@ export async function autoMatchPayments(orgId: string): Promise<AutoMatchResult>
     let didMatch = false;
 
     for (const inv of openInvoices) {
-      const invTotalCents = toCents(inv.gesamtbetrag || 0);
+      const invTotalCents = toCents(
+        getEffectiveInvoiceTotal(inv.gesamtbetrag, Number(inv.dunning_charges || 0)),
+      );
       const invAllocatedCents = toCents(inv.already_allocated || 0);
       const invDueCents = invTotalCents - invAllocatedCents;
 
@@ -352,12 +381,16 @@ export async function autoMatchPayments(orgId: string): Promise<AutoMatchResult>
       // Cent-Summe über alle offenen Rechnungen
       let totalDueCents = 0;
       for (const inv of openInvoices) {
-        totalDueCents += toCents(inv.gesamtbetrag || 0) - toCents(inv.already_allocated || 0);
+        totalDueCents += toCents(
+          getEffectiveInvoiceTotal(inv.gesamtbetrag, Number(inv.dunning_charges || 0)),
+        ) - toCents(inv.already_allocated || 0);
       }
 
       if (totalDueCents > 0 && Math.abs(unallocatedCents - totalDueCents) < 1) {
         for (const inv of openInvoices) {
-          const invDueCents = toCents(inv.gesamtbetrag || 0) - toCents(inv.already_allocated || 0);
+          const invDueCents = toCents(
+            getEffectiveInvoiceTotal(inv.gesamtbetrag, Number(inv.dunning_charges || 0)),
+          ) - toCents(inv.already_allocated || 0);
           if (invDueCents > 0) {
             await allocatePaymentToInvoice(payment.id, inv.id, fromCents(invDueCents), orgId);
             matched.push({

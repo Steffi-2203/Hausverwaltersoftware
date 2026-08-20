@@ -4,8 +4,9 @@ import { storage } from "./storage";
 import { db, rootDb, withOrgContext } from "./db";
 import { encryptField, decryptIbanRows, decryptIbanFields } from "./lib/fieldEncryption";
 import { parseMoneyInput } from "./lib/money";
-import { eq, and, sql, desc, asc, count, or, isNull, gte, lte, inArray, ne, ilike } from "drizzle-orm";
+import { eq, and, sql, desc, asc, count, sum, or, isNull, gte, lte, inArray, ne, ilike } from "drizzle-orm";
 import * as schema from "@shared/schema";
+import { roundMoney } from "@shared/utils";
 import { isAuthenticated, requireRole, requireMutationAccess, requireFinanceAccess, requireAdminAccess, getUserRoles, getProfileFromSession, isTester, maskPersonalData } from "./routes/helpers";
 import { registerFunctionRoutes } from "./functions";
 import { registerStripeRoutes } from "./stripeRoutes";
@@ -48,6 +49,25 @@ import leaseExpiryRouter from "./routes/leaseExpiryRoutes";
 import { sendLeaseExpiryNotifications } from "./services/leaseExpiryService";
 import { reportSchedules, organizations as orgsTable } from "@shared/schema";
 import { sendScheduledReport, parseNextRun } from "./services/scheduledReportsService";
+import { automatedDunningService } from "./services/automatedDunningService";
+import { getDunningChargesByInvoice, getOutstandingInvoiceAmount } from "./services/invoiceTotalsService";
+
+async function getDunningSurchargeMap(invoiceIds: string[]): Promise<Map<string, number>> {
+  if (invoiceIds.length === 0) return new Map();
+
+  const rows = await db.select({
+    invoiceId: schema.invoiceLines.invoiceId,
+    amount: sum(schema.invoiceLines.amount),
+  })
+    .from(schema.invoiceLines)
+    .where(and(
+      inArray(schema.invoiceLines.invoiceId, invoiceIds),
+      inArray(schema.invoiceLines.lineType, ['mahnstufe_fee', 'verzugszinsen']),
+    ))
+    .groupBy(schema.invoiceLines.invoiceId);
+
+  return new Map(rows.map((row) => [row.invoiceId, roundMoney(Number(row.amount) || 0)]));
+}
 
 // Runs hourly; the dedup table in lease_expiry_notifications prevents double-sends.
 function startLeaseExpiryChecker() {
@@ -715,6 +735,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
           lt(schema.monthlyInvoices.faelligAm, new Date().toISOString().split('T')[0])
         ));
 
+      const dunningSurcharges = await getDunningSurchargeMap(
+        overdueInvoices.map((row) => row.invoice.id),
+      );
       const tenantMap = new Map<string, any>();
 
       for (const row of overdueInvoices) {
@@ -736,12 +759,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
         }
         const entry = tenantMap.get(tid)!;
-        const invAmount = Number(row.invoice.gesamtbetrag || 0) - Number(row.invoice.paidAmount || 0);
+        const invoiceTotal = roundMoney(
+          Number(row.invoice.gesamtbetrag || 0) + (dunningSurcharges.get(row.invoice.id) || 0),
+        );
+        const invAmount = invoiceTotal - Number(row.invoice.paidAmount || 0);
         entry.invoices.push({
           id: row.invoice.id,
           month: row.invoice.month,
           year: row.invoice.year,
-          gesamtbetrag: Number(row.invoice.gesamtbetrag || 0),
+          gesamtbetrag: invoiceTotal,
           faellig_am: row.invoice.faelligAm,
           mahnstufe: row.invoice.mahnstufe || 0,
           zahlungserinnerung_am: (row.invoice as any).zahlungserinnerungAm || null,
@@ -780,7 +806,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "No organization" });
       }
       const body = snakeToCamel(req.body);
-      const { invoiceId, dunningLevel, tenantEmail, tenantName, propertyName, unitNumber, amount, dueDate } = body;
+      const { invoiceId, dunningLevel, tenantEmail, tenantName, propertyName, unitNumber } = body;
 
       if (!invoiceId || !tenantEmail) {
         return res.status(400).json({ error: "invoiceId und tenantEmail sind erforderlich" });
@@ -789,6 +815,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const invoiceWithOrg = await db.select({
         invoice: schema.monthlyInvoices,
         orgId: schema.properties.organizationId,
+        unitType: schema.units.type,
       })
         .from(schema.monthlyInvoices)
         .innerJoin(schema.tenants, eq(schema.monthlyInvoices.tenantId, schema.tenants.id))
@@ -801,20 +828,56 @@ export async function registerRoutes(app: Express): Promise<Server> {
         .limit(1);
       if (!invoiceWithOrg.length) return res.status(404).json({ error: "Rechnung nicht gefunden" });
 
-      const invoice = [invoiceWithOrg[0].invoice];
-      const newLevel = dunningLevel || ((invoice[0].mahnstufe || 0) + 1);
+      const invoice = invoiceWithOrg[0].invoice;
+      const newLevel = dunningLevel || ((invoice.mahnstufe || 0) + 1);
+      const dunningChargesByInvoice = await getDunningChargesByInvoice([invoiceId]);
+      const outstandingAmount = getOutstandingInvoiceAmount(
+        invoice.gesamtbetrag,
+        invoice.paidAmount,
+        dunningChargesByInvoice.get(invoiceId) || 0,
+      );
+      const dueDateValue = invoice.faelligAm ? new Date(invoice.faelligAm) : new Date();
+      const daysOverdue = Math.max(
+        0,
+        Math.floor((Date.now() - dueDateValue.getTime()) / (1000 * 60 * 60 * 24)),
+      );
+      const business = invoiceWithOrg[0].unitType === 'geschaeft'
+        || invoiceWithOrg[0].unitType === 'lager';
+      const charges = automatedDunningService.calculateDunningCharges(
+        outstandingAmount,
+        daysOverdue,
+        newLevel,
+        business,
+      );
 
       const levelLabels: Record<number, string> = { 1: 'Zahlungserinnerung', 2: '1. Mahnung', 3: '2. Mahnung' };
       const levelLabel = levelLabels[newLevel] || 'Zahlungserinnerung';
       const subject = `${levelLabel} - Offener Betrag für ${propertyName || 'Ihre Wohnung'}`;
+
+      // Claim and persist the charge before notifying the tenant. This avoids
+      // an email that demands a surcharge which lost the conditional
+      // escalation race and therefore was never booked on the invoice.
+      const recorded = await automatedDunningService.recordDunningCharges(profile.organizationId, {
+        invoiceId,
+        unitId: invoice.unitId,
+        currentLevel: invoice.mahnstufe || 0,
+        newLevel,
+        fee: charges.fee,
+        interest: charges.interest,
+      });
+      if (!recorded) {
+        return res.status(409).json({ error: "Die Mahnstufe wurde bereits verarbeitet" });
+      }
 
       const htmlBody = `
         <div style="font-family: Arial, sans-serif;">
           <h2>${levelLabel}</h2>
           <p>Sehr geehrte(r) ${tenantName || 'Mieter/in'},</p>
           <p>für Ihre Wohnung in der ${propertyName || ''} (${unitNumber || ''}) besteht noch ein offener Betrag:</p>
-          <p><strong>Offener Betrag: ${new Intl.NumberFormat('de-AT', { style: 'currency', currency: 'EUR' }).format(amount || 0)}</strong></p>
-          ${newLevel >= 2 ? `<p>Gemäß § 1333 ABGB sind wir berechtigt, Verzugszinsen in Höhe von 4% p.a. zu berechnen.</p>` : ''}
+           <p><strong>Offener Betrag: ${new Intl.NumberFormat('de-AT', { style: 'currency', currency: 'EUR' }).format(outstandingAmount)}</strong></p>
+           ${charges.fee > 0 ? `<p><strong>Mahngebühr: ${new Intl.NumberFormat('de-AT', { style: 'currency', currency: 'EUR' }).format(charges.fee)}</strong></p>` : ''}
+           ${charges.interest > 0 ? `<p><strong>Verzugszinsen: ${new Intl.NumberFormat('de-AT', { style: 'currency', currency: 'EUR' }).format(charges.interest)}</strong></p>` : ''}
+           ${newLevel >= 2 ? `<p><strong>Gesamtbetrag: ${new Intl.NumberFormat('de-AT', { style: 'currency', currency: 'EUR' }).format(charges.totalDue)}</strong></p>` : ''}
           ${newLevel >= 3 ? `<p><strong style="color: red;">Dies ist die letzte Mahnung vor Einleitung rechtlicher Schritte.</strong></p>` : ''}
           <p>Mit freundlichen Grüßen,<br>Ihre Hausverwaltung</p>
         </div>
@@ -822,19 +885,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const { sendEmail } = await import("./lib/resend");
       await sendEmail({ to: tenantEmail, subject, html: htmlBody });
-
-      // Org-Scope (Defense-in-Depth): Update nur für Rechnungen, deren
-      // Liegenschaft zur Organisation des Nutzers gehört — fremde IDs 0 Zeilen.
-      await db.update(schema.monthlyInvoices).set({
-        mahnstufe: newLevel,
-        status: 'ueberfaellig',
-      }).where(and(
-        eq(schema.monthlyInvoices.id, invoiceId),
-        inArray(schema.monthlyInvoices.unitId,
-          db.select({ id: schema.units.id }).from(schema.units)
-            .innerJoin(schema.properties, eq(schema.units.propertyId, schema.properties.id))
-            .where(eq(schema.properties.organizationId, profile.organizationId)))
-      ));
 
       res.json({ success: true, message: `${levelLabel} an ${tenantEmail} gesendet` });
     } catch (error) {
@@ -2970,86 +3020,15 @@ Antworte hilfreich, präzise und in österreichischem Deutsch.`
       const settingsRows = await db.select().from(schema.automationSettings)
         .where(eq(schema.automationSettings.organizationId, orgId)).limit(1);
       const settings = settingsRows[0];
-      const days1 = settings?.dunningDays1 || 14;
-      const days2 = settings?.dunningDays2 || 28;
-      const days3 = settings?.dunningDays3 || 42;
-      const interestRate = parseFloat(settings?.dunningInterestRate || '4.00');
-
-      const overdueInvoices = await db.select({
-        invoice: schema.monthlyInvoices,
-        tenantFirstName: schema.tenants.firstName,
-        tenantLastName: schema.tenants.lastName,
-        tenantEmail: schema.tenants.email,
-        tenantId: schema.tenants.id,
-      })
-        .from(schema.monthlyInvoices)
-        .innerJoin(schema.units, eq(schema.monthlyInvoices.unitId, schema.units.id))
-        .innerJoin(schema.properties, eq(schema.units.propertyId, schema.properties.id))
-        .leftJoin(schema.tenants, eq(schema.monthlyInvoices.tenantId, schema.tenants.id))
-        .where(and(
-          eq(schema.properties.organizationId, orgId),
-          or(eq(schema.monthlyInvoices.status, 'offen'), eq(schema.monthlyInvoices.status, 'ueberfaellig')),
-          lt(schema.monthlyInvoices.faelligAm, sql`CURRENT_DATE`)
-        ));
-
-      let processed = 0;
-      let emailsSent = 0;
-      const results: string[] = [];
-
-      for (const row of overdueInvoices) {
-        const inv = row.invoice;
-        const dueDate = new Date(inv.faelligAm!);
-        const today = new Date();
-        const daysOverdue = Math.floor((today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24));
-
-        let mahnstufe = 0;
-        if (daysOverdue >= days3) mahnstufe = 3;
-        else if (daysOverdue >= days2) mahnstufe = 2;
-        else if (daysOverdue >= days1) mahnstufe = 1;
-
-        if (mahnstufe === 0) continue;
-
-        const amount = parseFloat(inv.gesamtbetrag || '0');
-        const yearFraction = daysOverdue / 365;
-        const lateInterest = amount * (interestRate / 100) * yearFraction;
-
-        // Org-Scope (Defense-in-Depth): nur Rechnungen der eigenen Org
-        await db.update(schema.monthlyInvoices)
-          .set({ status: 'ueberfaellig' })
-          .where(and(
-            eq(schema.monthlyInvoices.id, inv.id),
-            inArray(schema.monthlyInvoices.unitId,
-              db.select({ id: schema.units.id }).from(schema.units)
-                .innerJoin(schema.properties, eq(schema.units.propertyId, schema.properties.id))
-                .where(eq(schema.properties.organizationId, orgId)))
-          ));
-
-        processed++;
-
-        const mahnstufeText = mahnstufe === 1 ? 'Zahlungserinnerung' : mahnstufe === 2 ? '2. Mahnung' : '3. Mahnung (letzte Mahnung)';
-        results.push(`${row.tenantFirstName} ${row.tenantLastName}: ${mahnstufeText} (${daysOverdue} Tage, \u20AC ${amount.toFixed(2)} + \u20AC ${lateInterest.toFixed(2)} Zinsen)`);
-
-        if (settings?.autoDunningEmail && row.tenantEmail) {
-          try {
-            const { sendEmail } = await import('./lib/resend');
-            await sendEmail({
-              to: row.tenantEmail,
-              subject: `${mahnstufeText} - Offener Betrag \u20AC ${amount.toFixed(2)}`,
-              text: `Sehr geehrte/r ${row.tenantFirstName} ${row.tenantLastName},\n\n` +
-                `wir weisen Sie darauf hin, dass folgender Betrag seit ${daysOverdue} Tagen überfällig ist:\n\n` +
-                `Offener Betrag: \u20AC ${amount.toFixed(2)}\n` +
-                `Verzugszinsen (${interestRate}% p.a. gem. ABGB \u00A71333): \u20AC ${lateInterest.toFixed(2)}\n` +
-                `Gesamtforderung: \u20AC ${(amount + lateInterest).toFixed(2)}\n` +
-                `Fällig seit: ${dueDate.toLocaleDateString('de-AT')}\n\n` +
-                `Bitte überweisen Sie den offenen Betrag umgehend.\n\n` +
-                `Mit freundlichen Grüßen\nIhre Hausverwaltung`,
-            });
-            emailsSent++;
-          } catch (emailErr) {
-            console.error('Dunning email failed:', emailErr);
-          }
-        }
-      }
+      const dunningRun = await automatedDunningService.processAutomatedDunning(
+        orgId,
+        settings?.autoDunningEmail === true,
+      );
+      const processed = dunningRun.processed;
+      const emailsSent = dunningRun.emailsSent;
+      const results = dunningRun.actions.map((action) =>
+        `${action.tenantName}: Mahnstufe ${action.newLevel} (EUR ${action.amount.toFixed(2)} + EUR ${(action.fee + action.interest).toFixed(2)} Zuschläge)`,
+      );
 
       if (settings) {
         await db.update(schema.automationSettings)

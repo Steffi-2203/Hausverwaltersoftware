@@ -1,12 +1,13 @@
 import { Router, Request, Response } from "express";
 import { db } from "../db";
-import { eq, and, desc, gte, lte, sql } from "drizzle-orm";
+import { eq, and, desc, gte, lte, sql, inArray } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { insertTenantSchema, insertRentHistorySchema } from "@shared/schema";
 import { storage } from "../storage";
 import { isAuthenticated, requireRole, getUserRoles, getProfileFromSession, isTester, maskPersonalData, snakeToCamel, parsePagination, paginateArray } from "./helpers";
 import { verifyTenantOwnership, verifyUnitOwnership } from "../lib/ownershipCheck";
 import { encryptField, decryptIbanFields } from "../lib/fieldEncryption";
+import { roundMoney } from "@shared/utils";
 
 const router = Router();
 
@@ -750,8 +751,35 @@ router.get("/api/tenants/:tenantId/invoices", isAuthenticated, async (req: any, 
     const isOwner = await verifyTenantOwnership(req.params.tenantId, profile.organizationId);
     if (!isOwner) return res.status(403).json({ error: "Zugriff verweigert" });
     const invoices = await storage.getInvoicesByTenant(req.params.tenantId);
+    const invoiceIds = invoices.map((invoice) => invoice.id);
+    const dunningLines = invoiceIds.length > 0
+      ? await db.select({
+        invoiceId: schema.invoiceLines.invoiceId,
+        amount: schema.invoiceLines.amount,
+      })
+        .from(schema.invoiceLines)
+        .where(and(
+          inArray(schema.invoiceLines.invoiceId, invoiceIds),
+          inArray(schema.invoiceLines.lineType, ['mahnstufe_fee', 'verzugszinsen']),
+        ))
+      : [];
+    const dunningChargesByInvoice = new Map<string, number>();
+    for (const line of dunningLines) {
+      dunningChargesByInvoice.set(
+        line.invoiceId,
+        roundMoney((dunningChargesByInvoice.get(line.invoiceId) || 0) + Number(line.amount)),
+      );
+    }
+    const invoicesWithDunningCharges = invoices.map((invoice) => {
+      const dunningCharges = dunningChargesByInvoice.get(invoice.id) || 0;
+      return {
+        ...invoice,
+        gesamtbetrag: roundMoney(Number(invoice.gesamtbetrag || 0) + dunningCharges),
+        dunningCharges,
+      };
+    });
     const roles = await getUserRoles(req);
-    res.json(isTester(roles) ? maskPersonalData(invoices) : invoices);
+    res.json(isTester(roles) ? maskPersonalData(invoicesWithDunningCharges) : invoicesWithDunningCharges);
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch tenant invoices" });
   }

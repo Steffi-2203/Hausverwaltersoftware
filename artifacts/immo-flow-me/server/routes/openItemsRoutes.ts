@@ -4,6 +4,7 @@ import { db } from "../db";
 import { monthlyInvoices, units, tenants, properties, payments, paymentAllocations, wegVorschreibungen, owners } from "@shared/schema";
 import { eq, ne, and, sql, gte, lte, desc, sum, isNull } from "drizzle-orm";
 import { exportOPListe } from "../services/xlsxExportService";
+import { getDunningChargesByInvoice, getEffectiveInvoiceTotal } from "../services/invoiceTotalsService";
 
 const router = Router();
 
@@ -53,8 +54,16 @@ router.get("/api/open-items", isAuthenticated, async (req: Request, res: Respons
       .where(and(...conditions))
       .orderBy(desc(monthlyInvoices.faelligAm));
 
+    const dunningChargesByInvoice = await getDunningChargesByInvoice(
+      results.map((result) => result.invoice.id),
+    );
     const items = results.map((r) => ({
       ...r.invoice,
+      gesamtbetrag: getEffectiveInvoiceTotal(
+        r.invoice.gesamtbetrag,
+        dunningChargesByInvoice.get(r.invoice.id) || 0,
+      ),
+      dunningCharges: dunningChargesByInvoice.get(r.invoice.id) || 0,
       source: 'monthly_invoice',
       unitTopNummer: r.unitTopNummer,
       propertyId: r.propertyId,
@@ -141,7 +150,10 @@ router.get("/api/open-items/kpis", isAuthenticated, async (req: Request, res: Re
         COUNT(*)::int AS total_open,
         COALESCE(SUM(outstanding), 0) AS total_open_amount
       FROM (
-        SELECT GREATEST(mi.gesamtbetrag::numeric - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
+        SELECT GREATEST(mi.gesamtbetrag::numeric + COALESCE((
+          SELECT SUM(il.amount::numeric) FROM invoice_lines il
+          WHERE il.invoice_id = mi.id AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+        ), 0) - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
         FROM monthly_invoices mi
         INNER JOIN units u ON u.id = mi.unit_id
         INNER JOIN properties p ON p.id = u.property_id
@@ -162,7 +174,10 @@ router.get("/api/open-items/kpis", isAuthenticated, async (req: Request, res: Re
         COUNT(*)::int AS overdue_count,
         COALESCE(SUM(outstanding), 0) AS overdue_amount
       FROM (
-        SELECT GREATEST(mi.gesamtbetrag::numeric - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
+        SELECT GREATEST(mi.gesamtbetrag::numeric + COALESCE((
+          SELECT SUM(il.amount::numeric) FROM invoice_lines il
+          WHERE il.invoice_id = mi.id AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+        ), 0) - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
         FROM monthly_invoices mi
         INNER JOIN units u ON u.id = mi.unit_id
         INNER JOIN properties p ON p.id = u.property_id
@@ -204,7 +219,10 @@ router.get("/api/open-items/kpis", isAuthenticated, async (req: Request, res: Re
         COALESCE(SUM(outstanding) FILTER (WHERE faellig_am < (CURRENT_DATE - INTERVAL '90 days')::date), 0) AS days90plus_amount
       FROM (
         SELECT mi.faellig_am,
-               GREATEST(mi.gesamtbetrag::numeric - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
+                GREATEST(mi.gesamtbetrag::numeric + COALESCE((
+                  SELECT SUM(il.amount::numeric) FROM invoice_lines il
+                  WHERE il.invoice_id = mi.id AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+                ), 0) - COALESCE(mi.paid_amount::numeric, 0), 0) AS outstanding
         FROM monthly_invoices mi
         INNER JOIN units u ON u.id = mi.unit_id
         INNER JOIN properties p ON p.id = u.property_id
@@ -270,7 +288,11 @@ router.get("/api/bank-matching/suggestions", isAuthenticated, async (req: Reques
       .where(isNull(payments.invoiceId));
 
     const openInvoices = await db.execute(sql`
-      SELECT mi.*, t.first_name, t.last_name, t.id AS tid
+      SELECT mi.*, t.first_name, t.last_name, t.id AS tid,
+        COALESCE((
+          SELECT SUM(il.amount::numeric) FROM invoice_lines il
+          WHERE il.invoice_id = mi.id AND il.line_type IN ('mahnstufe_fee', 'verzugszinsen')
+        ), 0) AS dunning_charges
       FROM monthly_invoices mi
       INNER JOIN units u ON u.id = mi.unit_id
       INNER JOIN properties p ON p.id = u.property_id
@@ -284,7 +306,7 @@ router.get("/api/bank-matching/suggestions", isAuthenticated, async (req: Reques
     const suggestions = unmatchedPayments.map((payment) => {
       const paymentAmount = Number(payment.betrag);
       const suggestedInvoices = invoiceRows.filter((inv: any) => {
-        const invoiceAmount = Number(inv.gesamtbetrag);
+        const invoiceAmount = getEffectiveInvoiceTotal(inv.gesamtbetrag, Number(inv.dunning_charges || 0));
         const amountMatch = Math.abs(paymentAmount - invoiceAmount) <= 0.01;
         const tenantMatch = payment.tenantId && inv.tenant_id === payment.tenantId;
         return amountMatch || tenantMatch;
@@ -352,7 +374,11 @@ router.post("/api/bank-matching/confirm", isAuthenticated, async (req: Request, 
     const totalAllocated = Number(
       ((allocationResult.rows || allocationResult)[0] as any).total_allocated || 0
     );
-    const invoiceTotal = Number(invoice.gesamtbetrag || 0);
+    const dunningCharges = await getDunningChargesByInvoice([invoiceId]);
+    const invoiceTotal = getEffectiveInvoiceTotal(
+      invoice.gesamtbetrag,
+      dunningCharges.get(invoiceId) || 0,
+    );
 
     if (totalAllocated >= invoiceTotal) {
       await db
@@ -411,8 +437,16 @@ router.get("/api/accounting/export/op-liste", isAuthenticated, async (req: Reque
       .where(and(...conditions))
       .orderBy(desc(monthlyInvoices.faelligAm));
 
+    const exportDunningChargesByInvoice = await getDunningChargesByInvoice(
+      results.map((result) => result.invoice.id),
+    );
     const items = results.map((r) => ({
       ...r.invoice,
+      gesamtbetrag: getEffectiveInvoiceTotal(
+        r.invoice.gesamtbetrag,
+        exportDunningChargesByInvoice.get(r.invoice.id) || 0,
+      ),
+      dunningCharges: exportDunningChargesByInvoice.get(r.invoice.id) || 0,
       source: 'monthly_invoice',
       unitTopNummer: r.unitTopNummer,
       propertyName: r.propertyName,

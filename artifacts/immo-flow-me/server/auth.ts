@@ -8,7 +8,7 @@ import zxcvbn from "zxcvbn";
 // Dieser rootDb-Import ist der einzige absichtliche RLS-Bypass im Request-Pfad.
 import { rootDb as db } from "./db";
 import * as schema from "@shared/schema";
-import { eq, and, desc, sql } from "drizzle-orm";
+import { eq, and, desc, gt, isNull, sql } from "drizzle-orm";
 import { sendEmail } from "./lib/resend";
 import { createAuditLog, getClientInfo } from "./lib/auditLog";
 import { logger } from "./lib/logger";
@@ -789,9 +789,17 @@ export function setupAuth(
         return res.status(400).json({ error: "Token ungueltig oder abgelaufen" });
       }
 
-      await db.update(schema.passwordResetTokens)
+      const consumedToken = await db.update(schema.passwordResetTokens)
         .set({ usedAt: new Date() })
-        .where(eq(schema.passwordResetTokens.id, resetToken.id));
+        .where(and(
+          eq(schema.passwordResetTokens.id, resetToken.id),
+          isNull(schema.passwordResetTokens.usedAt),
+          gt(schema.passwordResetTokens.expiresAt, new Date()),
+        ))
+        .returning({ id: schema.passwordResetTokens.id });
+      if (!consumedToken[0]) {
+        return res.status(400).json({ error: "Token ungueltig oder abgelaufen" });
+      }
 
       const profile = await getProfileById(resetToken.userId);
       if (!profile) {
@@ -799,6 +807,29 @@ export function setupAuth(
       }
 
       const roles = await getUserRoles(profile.id);
+      const twoFaRecord = await db.select().from(schema.user2fa)
+        .where(and(eq(schema.user2fa.userId, profile.id), eq(schema.user2fa.isEnabled, true)))
+        .limit(1);
+      const PRIVILEGED_ROLES = new Set(['admin', 'property_manager']);
+      if (roles.some((r: any) => PRIVILEGED_ROLES.has(r.role)) && !twoFaRecord[0]) {
+        (req.session as any).pending2FASetupUserId = profile.id;
+        delete req.session.userId;
+        delete req.session.email;
+        delete (req.session as any).organizationId;
+        delete (req.session as any).pending2FAUserId;
+        return req.session.save((err) => {
+          if (err) {
+            console.error("Session save error:", err);
+            return res.status(500).json({ error: "Session konnte nicht gespeichert werden" });
+          }
+          res.status(403).json({
+            error: "Zwei-Faktor-Authentifizierung muss eingerichtet werden",
+            code: "2FA_SETUP_REQUIRED",
+            message: "Bitte richten Sie die 2FA über den QR-Code ein, bevor Sie fortfahren.",
+          });
+        });
+      }
+
       const authToken = crypto.randomBytes(48).toString('hex');
       const tokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
       await db.execute(sql`
@@ -841,14 +872,42 @@ export function setupAuth(
         return res.redirect('/login?error=expired_token');
       }
 
-      await db.update(schema.passwordResetTokens)
+      const consumedToken = await db.update(schema.passwordResetTokens)
         .set({ usedAt: new Date() })
-        .where(eq(schema.passwordResetTokens.id, resetToken.id));
+        .where(and(
+          eq(schema.passwordResetTokens.id, resetToken.id),
+          isNull(schema.passwordResetTokens.usedAt),
+          gt(schema.passwordResetTokens.expiresAt, new Date()),
+        ))
+        .returning({ id: schema.passwordResetTokens.id });
+      if (!consumedToken[0]) {
+        return res.redirect('/login?error=expired_token');
+      }
 
       const profile = await getProfileById(resetToken.userId);
       
       if (!profile) {
         return res.redirect('/login?error=user_not_found');
+      }
+
+      const roles = await getUserRoles(profile.id);
+      const twoFaRecord = await db.select().from(schema.user2fa)
+        .where(and(eq(schema.user2fa.userId, profile.id), eq(schema.user2fa.isEnabled, true)))
+        .limit(1);
+      const PRIVILEGED_ROLES = new Set(['admin', 'property_manager']);
+      if (roles.some((r: any) => PRIVILEGED_ROLES.has(r.role)) && !twoFaRecord[0]) {
+        (req.session as any).pending2FASetupUserId = profile.id;
+        delete req.session.userId;
+        delete req.session.email;
+        delete (req.session as any).organizationId;
+        delete (req.session as any).pending2FAUserId;
+        return req.session.save((err) => {
+          if (err) {
+            console.error("Session save error:", err);
+            return res.redirect('/login?error=session_error');
+          }
+          res.redirect('/2fa-einrichten');
+        });
       }
 
       const authToken = crypto.randomBytes(48).toString('hex');

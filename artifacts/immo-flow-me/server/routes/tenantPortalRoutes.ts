@@ -1,9 +1,11 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { db, rootDb, orgContext, appPool } from "../db";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { eq, and, desc, asc } from "drizzle-orm";
+import { eq, and, desc, asc, inArray } from "drizzle-orm";
 import * as schema from "@shared/schema";
 import { decryptIbanFields } from "../lib/fieldEncryption";
+import { roundMoney } from "@shared/utils";
+import { getDunningChargesByInvoice, getEffectiveInvoiceTotal } from "../services/invoiceTotalsService";
 
 /**
  * Setzt den RLS-Org-Kontext für Mieterportal-Anfragen mit einer reinen
@@ -224,8 +226,18 @@ export function registerTenantPortalRoutes(app: Express) {
         .orderBy(desc(schema.leases.startDate))
         .limit(1);
 
+      const dunningChargesByInvoice = await getDunningChargesByInvoice(invoices.map((invoice) => invoice.id));
       const openInvoices = invoices.filter(i => i.status !== 'bezahlt' && i.status !== 'storniert');
-      const openBalance = openInvoices.reduce((sum, i) => sum + parseFloat(i.gesamtbetrag || '0'), 0);
+      const openBalance = roundMoney(openInvoices.reduce(
+        (total, invoice) => total + Math.max(
+          0,
+          getEffectiveInvoiceTotal(
+            invoice.gesamtbetrag,
+            dunningChargesByInvoice.get(invoice.id) || 0,
+          ) - Number(invoice.paidAmount || 0),
+        ),
+        0,
+      ));
 
       const docCount = await db
         .select()
@@ -277,7 +289,11 @@ export function registerTenantPortalRoutes(app: Express) {
           month: i.month,
           grundmiete: i.grundmiete,
           betriebskosten: i.betriebskosten,
-          gesamtbetrag: i.gesamtbetrag,
+          gesamtbetrag: getEffectiveInvoiceTotal(
+            i.gesamtbetrag,
+            dunningChargesByInvoice.get(i.id) || 0,
+          ),
+          dunningCharges: dunningChargesByInvoice.get(i.id) || 0,
           status: i.status,
           faelligkeitsDatum: i.faelligkeitsDatum,
         })),
@@ -314,6 +330,26 @@ export function registerTenantPortalRoutes(app: Express) {
         .where(conditions.length > 1 ? and(...conditions) : conditions[0])
         .orderBy(desc(schema.monthlyInvoices.year), desc(schema.monthlyInvoices.month));
 
+      const invoiceIds = invoices.map((invoice) => invoice.id);
+      const dunningLines = invoiceIds.length > 0
+        ? await db.select({
+          invoiceId: schema.invoiceLines.invoiceId,
+          amount: schema.invoiceLines.amount,
+        })
+          .from(schema.invoiceLines)
+          .where(and(
+            inArray(schema.invoiceLines.invoiceId, invoiceIds),
+            inArray(schema.invoiceLines.lineType, ['mahnstufe_fee', 'verzugszinsen']),
+          ))
+        : [];
+      const dunningChargesByInvoice = new Map<string, number>();
+      for (const line of dunningLines) {
+        dunningChargesByInvoice.set(
+          line.invoiceId,
+          roundMoney((dunningChargesByInvoice.get(line.invoiceId) || 0) + Number(line.amount)),
+        );
+      }
+
       const safeInvoices = invoices.map(i => ({
         id: i.id,
         year: i.year,
@@ -325,7 +361,10 @@ export function registerTenantPortalRoutes(app: Express) {
         ustSatzMiete: i.ustSatzMiete,
         ustSatzBk: i.ustSatzBk,
         ust: i.ust,
-        gesamtbetrag: i.gesamtbetrag,
+        gesamtbetrag: roundMoney(
+          Number(i.gesamtbetrag || 0) + (dunningChargesByInvoice.get(i.id) || 0),
+        ),
+        dunningCharges: dunningChargesByInvoice.get(i.id) || 0,
         status: i.status,
         faelligkeitsDatum: i.faelligkeitsDatum,
         rechnungsNummer: i.rechnungsNummer,

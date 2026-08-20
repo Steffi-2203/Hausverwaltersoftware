@@ -13,6 +13,7 @@ import { billingService } from "../services/billing.service";
 import { parseCamt053 } from "../services/camt053Service";
 import { generateVorschreibungPdf, type VorschreibungData } from "../services/pdfService";
 import { applyInvoiceStatusRules } from "../lib/invoiceStatusRules";
+import { roundMoney } from "@shared/utils";
 
 const router = Router();
 
@@ -782,8 +783,36 @@ router.get("/api/invoices", isAuthenticated, async (req: any, res) => {
         .where(whereCondition),
     ]);
 
+    const invoiceIds = invoices.map((invoice) => invoice.id);
+    const dunningLines = invoiceIds.length > 0
+      ? await db.select({
+        invoiceId: schema.invoiceLines.invoiceId,
+        amount: schema.invoiceLines.amount,
+      })
+        .from(schema.invoiceLines)
+        .where(and(
+          inArray(schema.invoiceLines.invoiceId, invoiceIds),
+          inArray(schema.invoiceLines.lineType, ['mahnstufe_fee', 'verzugszinsen']),
+        ))
+      : [];
+    const dunningChargesByInvoice = new Map<string, number>();
+    for (const line of dunningLines) {
+      dunningChargesByInvoice.set(
+        line.invoiceId,
+        roundMoney((dunningChargesByInvoice.get(line.invoiceId) || 0) + Number(line.amount)),
+      );
+    }
+
+    const invoicesWithDunningCharges = invoices.map((invoice) => {
+      const dunningCharges = dunningChargesByInvoice.get(invoice.id) || 0;
+      return {
+        ...invoice,
+        gesamtbetrag: roundMoney(Number(invoice.gesamtbetrag || 0) + dunningCharges),
+        dunningCharges,
+      };
+    });
     const roles = await getUserRoles(req);
-    const items = isTester(roles) ? maskPersonalData(invoices) : invoices;
+    const items = isTester(roles) ? maskPersonalData(invoicesWithDunningCharges) : invoicesWithDunningCharges;
     res.json({ data: items, pagination: { page, limit, total } });
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch invoices" });
@@ -804,8 +833,19 @@ router.get("/api/invoices/:id", isAuthenticated, async (req: any, res) => {
         return res.status(403).json({ error: "Access denied" });
       }
     }
+    const lines = await db.select().from(schema.invoiceLines)
+      .where(eq(schema.invoiceLines.invoiceId, invoice.id));
+    const dunningCharges = roundMoney(lines
+      .filter((line) => line.lineType === 'mahnstufe_fee' || line.lineType === 'verzugszinsen')
+      .reduce((total, line) => total + Number(line.amount), 0));
+    const invoiceWithDunningCharges = {
+      ...invoice,
+      gesamtbetrag: roundMoney(Number(invoice.gesamtbetrag || 0) + dunningCharges),
+      dunningCharges,
+      invoiceLines: lines,
+    };
     const roles = await getUserRoles(req);
-    res.json(isTester(roles) ? maskPersonalData(invoice) : invoice);
+    res.json(isTester(roles) ? maskPersonalData(invoiceWithDunningCharges) : invoiceWithDunningCharges);
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch invoice" });
   }

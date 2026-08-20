@@ -3,12 +3,10 @@
  * (Task #151, aufbauend auf der Middleware aus Task #130).
  *
  * Abgedeckte Wege — jeweils mit echten Endpunkten, echter Session und echter DB:
- *  1. Magic-Login (/api/auth/magic-login-api) eines Admins ohne 2FA →
- *     nächste geschützte API liefert 403 2FA_SETUP_REQUIRED; nach Setup via
- *     /api/2fa/setup + /api/2fa/verify-setup (echter TOTP-Code) klappt der Zugriff.
- *  2. Bearer-Token (aus Magic-Login) eines privilegierten Nutzers ohne 2FA wird
- *     von der Middleware blockiert (Token-Auflösung via resolveTokenAuth);
- *     ein nicht-privilegierter Nutzer kommt mit Bearer-Token durch.
+ *  1. Magic-Login eines Admins ohne 2FA → 403 2FA_SETUP_REQUIRED, nur
+ *     pending-Session und kein Bearer-Token; via staged Enrollment klappt der Zugriff.
+ *  2. Ein nicht-privilegierter Nutzer kommt per Magic-Login unverändert mit
+ *     Bearer-Token durch.
  *  3. Staged Enrollment: Passwort-Login eines Admins ohne 2FA → 403 mit
  *     pending-Session → /api/2fa/enrollment-setup + enrollment-verify →
  *     Vollzugang per Session UND per zurückgegebenem Bearer-Token.
@@ -38,7 +36,19 @@ const ADMIN_BEARER = randomUUID();  // Bearer-Block-Test (bleibt ohne 2FA)
 const VIEWER = randomUUID();        // Bearer-Erlaubt-Test
 const ADMIN_STAGED = randomUUID();  // Passwort-Login → staged Enrollment
 const VIEWER_HTML = randomUUID();   // Browser-Magic-Login (GET /api/auth/magic-login)
-const ALL = [ADMIN_MAGIC, ADMIN_BEARER, VIEWER, ADMIN_STAGED, VIEWER_HTML];
+const ADMIN_MAGIC_BROWSER = randomUUID(); // Browser-Magic-Login → staged Enrollment
+const VIEWER_MAGIC_API_RACE = randomUUID();
+const VIEWER_MAGIC_BROWSER_RACE = randomUUID();
+const ALL = [
+  ADMIN_MAGIC,
+  ADMIN_BEARER,
+  VIEWER,
+  ADMIN_STAGED,
+  VIEWER_HTML,
+  ADMIN_MAGIC_BROWSER,
+  VIEWER_MAGIC_API_RACE,
+  VIEWER_MAGIC_BROWSER_RACE,
+];
 
 const STAGED_PASSWORD = "E2e!Test-Passwort-2026-lang";
 
@@ -112,6 +122,9 @@ describe("2FA-Erzwingung End-to-End über echte Auth-Endpunkte", () => {
       [VIEWER, "viewer", "viewer"],
       [ADMIN_STAGED, "admin", "staged"],
       [VIEWER_HTML, "viewer", "html"],
+      [ADMIN_MAGIC_BROWSER, "admin", "magic-browser"],
+      [VIEWER_MAGIC_API_RACE, "viewer", "magic-api-race"],
+      [VIEWER_MAGIC_BROWSER_RACE, "viewer", "magic-browser-race"],
     ];
     for (const [id, role, tag] of rows) {
       await rootDb.insert(schema.profiles).values({
@@ -134,31 +147,33 @@ describe("2FA-Erzwingung End-to-End über echte Auth-Endpunkte", () => {
     await rootDb.delete(schema.organizations).where(eq(schema.organizations.id, ORG_ID));
   });
 
-  test("Magic-Login → 403 auf geschützter API → Setup+Verify → Zugriff klappt", async () => {
+  test("Magic-Login-API eines Admins ohne 2FA startet staged Enrollment ohne Token", async () => {
     const app = makeApp();
     const agent = request.agent(app);
 
     const magicToken = await seedMagicToken(ADMIN_MAGIC);
     const login = await agent.post("/api/auth/magic-login-api").send({ token: magicToken });
-    assert.equal(login.status, 200, JSON.stringify(login.body));
-    assert.ok(login.body.token, "Magic-Login muss ein Bearer-Token zurückgeben");
+    assert.equal(login.status, 403, JSON.stringify(login.body));
+    assert.equal(login.body.code, "2FA_SETUP_REQUIRED");
+    assert.equal(login.body.token, undefined, "vor Enrollment darf kein Bearer-Token ausgegeben werden");
+    const beforeEnrollment = await rootDb.select().from(schema.authTokens)
+      .where(eq(schema.authTokens.userId, ADMIN_MAGIC));
+    assert.equal(beforeEnrollment.length, 0, "vor Enrollment darf kein auth_token persistiert werden");
 
-    // Geschützte API mit Session-Cookie: blockiert
+    // Die pending-Session ist kein Vollzugang.
     const blocked = await agent.get("/api/dashboard");
-    assert.equal(blocked.status, 403);
-    assert.equal(blocked.body.code, "2FA_SETUP_REQUIRED");
-    assert.equal(blocked.body.redirectTo, "/2fa-einrichten");
+    assert.equal(blocked.status, 401);
 
-    // 2FA-Setup über die echten Endpunkte
-    const setup = await agent.post("/api/2fa/setup").send({});
+    // Nur der staged Enrollment-Pfad darf fortfahren.
+    const setup = await agent.post("/api/2fa/enrollment-setup").send({});
     assert.equal(setup.status, 200, JSON.stringify(setup.body));
     assert.ok(setup.body.secret, "Setup muss ein TOTP-Secret liefern");
 
     const verify = await agent
-      .post("/api/2fa/verify-setup")
+      .post("/api/2fa/enrollment-verify")
       .send({ token: totpFor(setup.body.secret) });
     assert.equal(verify.status, 200, JSON.stringify(verify.body));
-    assert.equal(verify.body.success, true);
+    assert.ok(verify.body.token, "erst enrollment-verify darf ein Bearer-Token liefern");
     assert.ok(Array.isArray(verify.body.backupCodes) && verify.body.backupCodes.length > 0);
 
     // Jetzt kommt derselbe Nutzer durch
@@ -187,22 +202,54 @@ describe("2FA-Erzwingung End-to-End über echte Auth-Endpunkte", () => {
     assert.equal(orgScoped.body.orgId, ORG_ID);
   });
 
-  test("Bearer-Token eines privilegierten Nutzers ohne 2FA wird blockiert", async () => {
+  test("Browser-Magic-Login eines Admins ohne 2FA startet ebenfalls staged Enrollment", async () => {
     const app = makeApp();
+    const agent = request.agent(app);
 
-    const magicToken = await seedMagicToken(ADMIN_BEARER);
-    const login = await request(app)
-      .post("/api/auth/magic-login-api")
-      .send({ token: magicToken });
-    assert.equal(login.status, 200, JSON.stringify(login.body));
-    const bearer = login.body.token as string;
+    const magicToken = await seedMagicToken(ADMIN_MAGIC_BROWSER);
+    const login = await agent.get(`/api/auth/magic-login?token=${magicToken}`);
+    assert.equal(login.status, 302, JSON.stringify(login.body));
+    assert.equal(login.headers.location, "/2fa-einrichten");
+    const authTokens = await rootDb.select().from(schema.authTokens)
+      .where(eq(schema.authTokens.userId, ADMIN_MAGIC_BROWSER));
+    assert.equal(authTokens.length, 0, "Browser-Magic-Login darf vor Enrollment keinen Token erzeugen");
 
-    // Frische Anfrage OHNE Cookie, nur mit Bearer-Token → resolveTokenAuth-Pfad
-    const blocked = await request(app)
-      .get("/api/dashboard")
-      .set("Authorization", `Bearer ${bearer}`);
-    assert.equal(blocked.status, 403);
-    assert.equal(blocked.body.code, "2FA_SETUP_REQUIRED");
+    const blocked = await agent.get("/api/dashboard");
+    assert.equal(blocked.status, 401);
+    const setup = await agent.post("/api/2fa/enrollment-setup").send({});
+    assert.equal(setup.status, 200, JSON.stringify(setup.body));
+  });
+
+  test("API-Magic-Login verbraucht denselben Viewer-Link parallel nur einmal", async () => {
+    const app = makeApp();
+    const magicToken = await seedMagicToken(VIEWER_MAGIC_API_RACE);
+
+    const attempts = await Promise.all([
+      request(app).post("/api/auth/magic-login-api").send({ token: magicToken }),
+      request(app).post("/api/auth/magic-login-api").send({ token: magicToken }),
+    ]);
+
+    assert.equal(attempts.filter((attempt) => attempt.status === 200).length, 1);
+    assert.equal(attempts.filter((attempt) => attempt.status === 400).length, 1);
+    const authTokens = await rootDb.select().from(schema.authTokens)
+      .where(eq(schema.authTokens.userId, VIEWER_MAGIC_API_RACE));
+    assert.equal(authTokens.length, 1, "ein Einmal-Link darf höchstens einen Bearer-Token ausstellen");
+  });
+
+  test("Browser-Magic-Login verbraucht denselben Viewer-Link parallel nur einmal", async () => {
+    const app = makeApp();
+    const magicToken = await seedMagicToken(VIEWER_MAGIC_BROWSER_RACE);
+
+    const attempts = await Promise.all([
+      request(app).get(`/api/auth/magic-login?token=${magicToken}`),
+      request(app).get(`/api/auth/magic-login?token=${magicToken}`),
+    ]);
+
+    assert.equal(attempts.filter((attempt) => attempt.status === 200).length, 1);
+    assert.equal(attempts.filter((attempt) => attempt.status === 302).length, 1);
+    const authTokens = await rootDb.select().from(schema.authTokens)
+      .where(eq(schema.authTokens.userId, VIEWER_MAGIC_BROWSER_RACE));
+    assert.equal(authTokens.length, 1, "ein Einmal-Link darf höchstens einen Bearer-Token ausstellen");
   });
 
   test("Bearer-Token eines nicht-privilegierten Nutzers wird durchgelassen", async () => {

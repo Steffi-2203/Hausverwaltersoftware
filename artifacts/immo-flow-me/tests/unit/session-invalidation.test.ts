@@ -150,19 +150,22 @@ describe("Cross-Session-Invalidierung bei 2FA-Disable und Rollenänderung", () =
     const agentA = request.agent(app);
     const agentB = request.agent(app);
 
-    // Session A: Magic-Login → 2FA einrichten (echter Flow)
+    // Session A: Magic-Login → staged 2FA Enrollment (echter Flow)
     const loginA = await agentA
       .post("/api/auth/magic-login-api")
       .send({ token: await seedMagicToken(ADMIN) });
-    assert.equal(loginA.status, 200);
-    const bearer = loginA.body.token as string;
-    assert.ok(bearer);
+    assert.equal(loginA.status, 403, JSON.stringify(loginA.body));
+    assert.equal(loginA.body.code, "2FA_SETUP_REQUIRED");
 
-    const setup = await agentA.post("/api/2fa/setup");
+    const setup = await agentA.post("/api/2fa/enrollment-setup");
     assert.equal(setup.status, 200, JSON.stringify(setup.body));
     const secret = setup.body.secret as string;
-    const verify = await agentA.post("/api/2fa/verify-setup").send({ token: totpFor(secret) });
+    const verify = await agentA
+      .post("/api/2fa/enrollment-verify")
+      .send({ token: totpFor(secret) });
     assert.equal(verify.status, 200, JSON.stringify(verify.body));
+    const bearer = verify.body.token as string;
+    assert.ok(bearer);
 
     // Session B: zweiter Login desselben Nutzers, funktioniert
     const loginB = await agentB

@@ -1,10 +1,11 @@
 import { db } from "../db";
-import { monthlyInvoices, tenants, units, properties, messages } from "@shared/schema";
-import { eq, and, lt, or, isNull, inArray } from "drizzle-orm";
+import { monthlyInvoices, invoiceLines, tenants, units, properties, messages } from "@shared/schema";
+import { eq, and, lt, or, isNull, inArray, sum } from "drizzle-orm";
 import { sendEmail } from "../lib/resend";
 import { roundMoney } from "@shared/utils";
 import { format, differenceInDays, addDays } from "date-fns";
 import { de } from "date-fns/locale";
+import { getDunningChargesByInvoice, getOutstandingInvoiceAmount } from "./invoiceTotalsService";
 
 interface DunningLevel {
   level: 0 | 1 | 2 | 3;
@@ -46,6 +47,7 @@ function isBusinessTenant(unitType: string | null | undefined): boolean {
 
 interface DunningAction {
   invoiceId: string;
+  unitId: string;
   tenantId: string;
   tenantEmail: string;
   tenantName: string;
@@ -57,6 +59,15 @@ interface DunningAction {
   fee: number;
   interest: number;
   totalDue: number;
+}
+
+export interface DunningChargeInput {
+  invoiceId: string;
+  unitId: string;
+  currentLevel: number;
+  newLevel: number;
+  fee: number;
+  interest: number;
 }
 
 export class AutomatedDunningService {
@@ -72,6 +83,22 @@ export class AutomatedDunningService {
   private calculateFee(level: DunningLevel, business: boolean): number {
     if (!business) return level.fee;
     return level.level >= 2 ? roundMoney(level.fee + UGB_LUMP_SUM_FEE) : level.fee;
+  }
+
+  calculateDunningCharges(
+    amount: number,
+    daysOverdue: number,
+    level: number,
+    business = false,
+  ): { fee: number; interest: number; totalDue: number } {
+    const levelInfo = DUNNING_LEVELS.find((entry) => entry.level === level) ?? DUNNING_LEVELS[0];
+    const fee = this.calculateFee(levelInfo, business);
+    const interest = this.calculateInterest(amount, daysOverdue, business);
+    return {
+      fee,
+      interest,
+      totalDue: roundMoney(amount + fee + interest),
+    };
   }
 
   private getDunningLevel(daysOverdue: number): DunningLevel {
@@ -106,6 +133,9 @@ export class AutomatedDunningService {
         lt(monthlyInvoices.faelligAm, today.toISOString())
       ));
 
+    const dunningChargesByInvoice = await getDunningChargesByInvoice(
+      overdueInvoices.map((row) => row.invoice.id),
+    );
     const actions: DunningAction[] = [];
 
     for (const row of overdueInvoices) {
@@ -118,15 +148,22 @@ export class AutomatedDunningService {
       const newDunningLevel = this.getDunningLevel(daysOverdue);
       
       if (newDunningLevel.level > currentLevel && row.tenant.email) {
-        const invoiceTotal = Number(row.invoice.gesamtbetrag) || 0;
-        const paidAmount = Number(row.invoice.paidAmount) || 0;
-        const amount = roundMoney(invoiceTotal - paidAmount);
+        const amount = getOutstandingInvoiceAmount(
+          row.invoice.gesamtbetrag,
+          row.invoice.paidAmount,
+          dunningChargesByInvoice.get(row.invoice.id) || 0,
+        );
         const business = isBusinessTenant(row.unit.type as string | null);
-        const interest = this.calculateInterest(amount, daysOverdue, business);
-        const fee = this.calculateFee(newDunningLevel, business);
+        const { fee, interest, totalDue } = this.calculateDunningCharges(
+          amount,
+          daysOverdue,
+          newDunningLevel.level,
+          business,
+        );
         
         actions.push({
           invoiceId: row.invoice.id,
+          unitId: row.unit.id,
           tenantId: row.tenant.id,
           tenantEmail: row.tenant.email,
           tenantName: `${row.tenant.firstName || ''} ${row.tenant.lastName || ''}`.trim(),
@@ -137,12 +174,101 @@ export class AutomatedDunningService {
           amount,
           fee,
           interest,
-          totalDue: roundMoney(amount + fee + interest),
+          totalDue,
         });
       }
     }
 
     return actions;
+  }
+
+  /**
+   * Claims a dunning escalation and appends its charges to the invoice ledger.
+   *
+   * `monthly_invoices.gesamtbetrag` is intentionally immutable after creation.
+   * The surcharge lines are therefore the source of truth for the additional
+   * amount shown on invoice detail/PDF views.
+   */
+  async recordDunningCharges(
+    organizationId: string,
+    input: DunningChargeInput,
+  ): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const updated = await tx.update(monthlyInvoices)
+        .set({
+          mahnstufe: input.newLevel,
+          status: 'ueberfaellig',
+        })
+        .where(and(
+          eq(monthlyInvoices.id, input.invoiceId),
+          eq(monthlyInvoices.mahnstufe, input.currentLevel),
+          inArray(
+            monthlyInvoices.unitId,
+            tx.select({ id: units.id })
+              .from(units)
+              .innerJoin(properties, eq(units.propertyId, properties.id))
+              .where(eq(properties.organizationId, organizationId))
+          ),
+        ))
+        .returning({ id: monthlyInvoices.id });
+
+      // Another worker already claimed this escalation.
+      if (updated.length === 0) return false;
+
+      // calculateInterest() is cumulative from the original due date. Each
+      // append-only line must therefore contain only the newly accrued part,
+      // otherwise a level-3 escalation would charge the level-2 interest twice.
+      const [existingInterest] = await tx.select({
+        total: sum(invoiceLines.amount),
+      })
+        .from(invoiceLines)
+        .where(and(
+          eq(invoiceLines.invoiceId, input.invoiceId),
+          eq(invoiceLines.lineType, 'verzugszinsen'),
+        ));
+      const interestToRecord = roundMoney(Math.max(
+        0,
+        input.interest - Number(existingInterest?.total || 0),
+      ));
+
+      const lines = [];
+      if (input.fee > 0) {
+        lines.push({
+          invoiceId: input.invoiceId,
+          unitId: input.unitId,
+          lineType: 'mahnstufe_fee',
+          description: `Mahngebühr Stufe ${input.newLevel}`,
+          normalizedDescription: `mahnstufe_fee:${input.newLevel}`,
+          amount: roundMoney(input.fee).toFixed(2),
+          taxRate: 0,
+          meta: { dunningLevel: input.newLevel, organizationId },
+        });
+      }
+      if (interestToRecord > 0) {
+        lines.push({
+          invoiceId: input.invoiceId,
+          unitId: input.unitId,
+          lineType: 'verzugszinsen',
+          description: `Verzugszinsen Stufe ${input.newLevel}`,
+          normalizedDescription: `verzugszinsen:${input.newLevel}`,
+          amount: interestToRecord.toFixed(2),
+          taxRate: 0,
+          meta: {
+            dunningLevel: input.newLevel,
+            organizationId,
+            cumulativeInterest: input.interest,
+          },
+        });
+      }
+
+      if (lines.length > 0) {
+        await tx.insert(invoiceLines)
+          .values(lines)
+          .onConflictDoNothing();
+      }
+
+      return true;
+    });
   }
 
   async processAutomatedDunning(organizationId: string, sendEmails: boolean = false): Promise<{
@@ -153,26 +279,19 @@ export class AutomatedDunningService {
   }> {
     const actions = await this.checkOverdueInvoices(organizationId);
     let emailsSent = 0;
+    const processedActions: DunningAction[] = [];
 
     for (const action of actions) {
-      // Org-Scope (Defense-in-Depth zu RLS): monthly_invoices hat keine
-      // organization_id — kanonische Kette wie im RLS-Modell:
-      // invoice.unit_id → unit → property. Eine fremde invoiceId trifft 0 Zeilen.
-      await db.update(monthlyInvoices)
-        .set({ 
-          mahnstufe: action.newLevel,
-          status: 'ueberfaellig',
-        })
-        .where(and(
-          eq(monthlyInvoices.id, action.invoiceId),
-          inArray(
-            monthlyInvoices.unitId,
-            db.select({ id: units.id })
-              .from(units)
-              .innerJoin(properties, eq(units.propertyId, properties.id))
-              .where(eq(properties.organizationId, organizationId))
-          )
-        ));
+      const recorded = await this.recordDunningCharges(organizationId, {
+        invoiceId: action.invoiceId,
+        unitId: action.unitId,
+        currentLevel: action.currentLevel,
+        newLevel: action.newLevel,
+        fee: action.fee,
+        interest: action.interest,
+      });
+      if (!recorded) continue;
+      processedActions.push(action);
 
       if (sendEmails && action.tenantEmail) {
         try {
@@ -206,10 +325,10 @@ export class AutomatedDunningService {
     }
 
     return {
-      processed: actions.length,
-      escalated: actions.filter(a => a.newLevel > a.currentLevel).length,
+      processed: processedActions.length,
+      escalated: processedActions.filter(a => a.newLevel > a.currentLevel).length,
       emailsSent,
-      actions,
+      actions: processedActions,
     };
   }
 

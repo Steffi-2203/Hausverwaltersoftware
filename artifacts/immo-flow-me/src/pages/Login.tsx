@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, useLocation, Link, useSearchParams } from 'react-router-dom';
 import { useAuth } from '@/hooks/useAuth';
 import { Button } from '@/components/ui/button';
@@ -24,10 +24,12 @@ export default function Login() {
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [debugInfo, setDebugInfo] = useState('');
+  const processedMagicToken = useRef<string | null>(null);
 
   useEffect(() => {
     const magicToken = searchParams.get('magic');
-    if (magicToken && !isSubmitting) {
+    if (magicToken && processedMagicToken.current !== magicToken) {
+      processedMagicToken.current = magicToken;
       setIsSubmitting(true);
       setDebugInfo('Auto-Login...');
       fetch('/api/auth/magic-login-api', {
@@ -36,8 +38,19 @@ export default function Login() {
         body: JSON.stringify({ token: magicToken }),
         credentials: 'include',
       })
-        .then(res => res.json())
-        .then(result => {
+        .then(async (res) => ({ ok: res.ok, result: await res.json() }))
+        .then(({ ok, result }) => {
+          if (!ok) {
+            if (result.code === '2FA_SETUP_REQUIRED') {
+              setDebugInfo('2FA-Einrichtung erforderlich...');
+              navigate('/2fa-einrichten', { replace: true });
+              return;
+            }
+            setDebugInfo('Fehler: ' + (result.error || 'Unbekannt'));
+            setIsSubmitting(false);
+            return;
+          }
+
           if (result.token) {
             setAuthToken(result.token);
             queryClient.setQueryData(["/api/auth/user"], {

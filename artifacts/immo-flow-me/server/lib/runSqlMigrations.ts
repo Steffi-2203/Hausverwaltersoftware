@@ -38,9 +38,31 @@ const IGNORABLE_PG_CODES = new Set([
   "42701", // duplicate_column
   "42P07", // duplicate_table
   "42710", // duplicate_object
-  "23505", // unique_violation (e.g. duplicate index name)
   "42P16", // invalid_table_definition (RLS already enabled)
 ]);
+
+function isTransactionBegin(stmt: string): boolean {
+  return /^(?:BEGIN(?:\s+(?:WORK|TRANSACTION))?|START\s+TRANSACTION)\b/i.test(
+    stmt.trim()
+  );
+}
+
+function isTransactionEnd(stmt: string): boolean {
+  return /^(?:COMMIT|ROLLBACK)(?:\s+(?:WORK|TRANSACTION))?\b/i.test(
+    stmt.trim()
+  );
+}
+
+/**
+ * Older migration files may already own their BEGIN/COMMIT boundaries. Newer
+ * files are wrapped by the runner so a failed statement cannot leave a partial
+ * schema change behind. Never nest those two transaction ownership models.
+ */
+export function hasExplicitTransactionControl(statements: string[]): boolean {
+  return statements.some(
+    (stmt) => isTransactionBegin(stmt) || isTransactionEnd(stmt)
+  );
+}
 
 /**
  * Splits a SQL file into individual statements using a lexical state machine.
@@ -214,37 +236,80 @@ export async function runSqlMigrations(): Promise<void> {
       const statements = splitStatements(sqlContent).filter(
         (s) => s.trim().length > 0
       );
+      const runnerOwnsTransaction = !hasExplicitTransactionControl(statements);
+      let migrationTransactionOpen = false;
 
-      const errors: string[] = [];
-      for (const stmt of statements) {
-        try {
-          await client.query(stmt);
-        } catch (err: any) {
-          const code: string = err.code ?? "";
-          if (IGNORABLE_PG_CODES.has(code)) {
-            // "Already exists" — harmless in an idempotent migration.
-            logger.info(
-              `[migrations] ${filename}: ignorable pg error ${code} — ${err.message.split("\n")[0]}`
-            );
-          } else {
+      try {
+        if (runnerOwnsTransaction) {
+          await client.query("BEGIN");
+          migrationTransactionOpen = true;
+        }
+
+        for (const stmt of statements) {
+          if (!runnerOwnsTransaction && isTransactionBegin(stmt)) {
+            await client.query(stmt);
+            migrationTransactionOpen = true;
+            continue;
+          }
+
+          if (!runnerOwnsTransaction && isTransactionEnd(stmt)) {
+            await client.query(stmt);
+            migrationTransactionOpen = false;
+            continue;
+          }
+
+          if (migrationTransactionOpen) {
+            await client.query("SAVEPOINT sql_migration_statement");
+          }
+
+          try {
+            await client.query(stmt);
+            if (migrationTransactionOpen) {
+              await client.query("RELEASE SAVEPOINT sql_migration_statement");
+            }
+          } catch (err: any) {
+            const code: string = err.code ?? "";
+            if (IGNORABLE_PG_CODES.has(code)) {
+              if (migrationTransactionOpen) {
+                await client.query("ROLLBACK TO SAVEPOINT sql_migration_statement");
+                await client.query("RELEASE SAVEPOINT sql_migration_statement");
+              }
+              // "Already exists" — harmless in an idempotent migration.
+              logger.info(
+                `[migrations] ${filename}: ignorable pg error ${code} — ${err.message.split("\n")[0]}`
+              );
+              continue;
+            }
+
+            if (migrationTransactionOpen) {
+              await client.query("ROLLBACK TO SAVEPOINT sql_migration_statement");
+              await client.query("RELEASE SAVEPOINT sql_migration_statement");
+            }
             logger.error(
               `[migrations] FATAL: Statement failed in ${filename} (pg ${code}): ${err.message}\nSQL: ${stmt.slice(0, 300)}`
             );
-            errors.push(`[${code}] ${err.message.split("\n")[0]}`);
+            throw err;
           }
         }
-      }
 
-      if (errors.length === 0) {
         await markApplied(client, filename);
+        if (runnerOwnsTransaction) {
+          await client.query("COMMIT");
+          migrationTransactionOpen = false;
+        }
         logger.info(`[migrations] Applied: ${filename}`);
         appliedCount++;
-      } else {
-        // Throw so the server aborts boot — operator must fix the migration.
+      } catch (err: any) {
+        if (migrationTransactionOpen) {
+          try {
+            await client.query("ROLLBACK");
+          } catch {
+            // A failed BEGIN cannot leave a transaction to roll back.
+          }
+        }
         throw new Error(
-          `Migration ${filename} failed with ${errors.length} error(s):\n` +
-          errors.map((e, i) => `  ${i + 1}. ${e}`).join("\n") +
-          "\nFix the migration file and restart the server."
+          `Migration ${filename} failed and was rolled back: ` +
+          `[${err?.code ?? "unknown"}] ${err?.message?.split("\n")[0] ?? String(err)}`
         );
       }
     }

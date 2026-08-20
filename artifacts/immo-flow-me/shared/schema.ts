@@ -595,7 +595,7 @@ export const settlementDetails = pgTable("settlement_details", {
 
 export const distributionKeys = pgTable("distribution_keys", {
   id: uuid("id").defaultRandom().primaryKey(),
-  organizationId: uuid("organization_id").references(() => organizations.id),
+  organizationId: uuid("organization_id").notNull().references(() => organizations.id),
   propertyId: uuid("property_id").references(() => properties.id),
   keyCode: text("key_code").notNull(),
   name: text("name").notNull(),

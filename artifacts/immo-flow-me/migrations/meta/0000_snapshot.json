@@ -2151,7 +2151,7 @@
           "name": "organization_id",
           "type": "uuid",
           "primaryKey": false,
-          "notNull": false
+          "notNull": true
         },
         "property_id": {
           "name": "property_id",

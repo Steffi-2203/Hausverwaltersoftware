@@ -4,6 +4,7 @@ import { eq, and, inArray, isNull } from "drizzle-orm";
 import { format } from "date-fns";
 import { logger } from "../lib/logger";
 import { decryptField } from "../lib/fieldEncryption";
+import { getDunningChargesByInvoice, getOutstandingInvoiceAmount } from "./invoiceTotalsService";
 
 interface SepaPayment {
   id: string;
@@ -150,6 +151,9 @@ export class SepaExportService {
     // Namen gemeldet, damit sie gezielt korrigiert werden können.
     const rejected: string[] = [];
     const payments: SepaPayment[] = [];
+    const dunningChargesByInvoice = await getDunningChargesByInvoice(
+      invoicesData.map((entry) => entry.invoice.id),
+    );
 
     for (const d of invoicesData) {
       const tenantName = `${d.tenant.firstName || ''} ${d.tenant.lastName || ''}`.trim() || 'Unbekannt';
@@ -157,9 +161,11 @@ export class SepaExportService {
       // muss der offene Restbetrag (gesamtbetrag - paidAmount) eingezogen werden,
       // nicht der volle Rechnungsbetrag. Andernfalls würde der bereits geleistete
       // Teilbetrag ein zweites Mal belastet.
-      const invoiceTotal = Number(d.invoice.gesamtbetrag) || 0;
-      const paidAmount = Number(d.invoice.paidAmount) || 0;
-      const amount = Math.max(0, Math.round((invoiceTotal - paidAmount) * 100) / 100);
+      const amount = getOutstandingInvoiceAmount(
+        d.invoice.gesamtbetrag,
+        d.invoice.paidAmount,
+        dunningChargesByInvoice.get(d.invoice.id) || 0,
+      );
 
       if (amount <= 0) {
         rejected.push(`${tenantName}: Betrag ist ${amount.toFixed(2)} EUR`);
