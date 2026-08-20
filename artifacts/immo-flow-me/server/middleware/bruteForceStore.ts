@@ -35,6 +35,13 @@ export interface BruteForceStore {
   recordFailure(key: string): Promise<void>;
   /** Loescht den Fehlversuch-Zaehler nach erfolgreicher Authentifizierung. */
   clearFailures(key: string): Promise<void>;
+  /**
+   * Loescht den Zähler nur, wenn keine aktive Sperre besteht. Verhindert, dass
+   * ein erfolgreicher paralleler Request eine gerade gesetzte Sperre umgeht.
+   */
+  clearFailuresIfNotBlocked(key: string): Promise<boolean>;
+  /** Aktueller Fehlversuchstand im Zeitfenster für die Login-Rückmeldung. */
+  getFailureCount(key: string): Promise<number>;
   /** Testdiagnostik. */
   _counterSize(): Promise<number>;
   _lockoutSize(): Promise<number>;
@@ -110,6 +117,22 @@ export class InMemoryBruteForceStore implements BruteForceStore {
     // lockoutMap wird NICHT geleert (siehe apiKey.ts-Kommentar).
   }
 
+  async clearFailuresIfNotBlocked(key: string): Promise<boolean> {
+    if (await this.isBlocked(key)) return false;
+    this.failedMap.delete(key);
+    return true;
+  }
+
+  async getFailureCount(key: string): Promise<number> {
+    const rec = this.failedMap.get(key);
+    if (!rec) return 0;
+    if (Date.now() > rec.resetAt) {
+      this.failedMap.delete(key);
+      return 0;
+    }
+    return rec.count;
+  }
+
   async _counterSize(): Promise<number> { return this.failedMap.size; }
   async _lockoutSize(): Promise<number> { return this.lockoutMap.size; }
 }
@@ -146,6 +169,18 @@ end
 return c
 `.trim();
 
+const CLEAR_IF_NOT_BLOCKED_LUA = `
+if redis.call('EXISTS', KEYS[2]) > 0 then
+  return 0
+end
+local c = redis.call('GET', KEYS[1])
+if c and tonumber(c) >= tonumber(ARGV[1]) then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+return 1
+`.trim();
+
 export class RedisBruteForceStore implements BruteForceStore {
   private readonly blockDurationMs: number;
   private readonly maxFailedAttempts: number;
@@ -180,6 +215,19 @@ export class RedisBruteForceStore implements BruteForceStore {
   async clearFailures(key: string): Promise<void> {
     await this.redis.del(FAIL_PREFIX + key);
     // Tier-1-Sperre bleibt bestehen (laeuft zeitbasiert ab).
+  }
+
+  async clearFailuresIfNotBlocked(key: string): Promise<boolean> {
+    const result = await this.redis.eval(CLEAR_IF_NOT_BLOCKED_LUA, {
+      keys: [FAIL_PREFIX + key, LOCK_PREFIX + key],
+      arguments: [String(this.maxFailedAttempts)],
+    });
+    return Number(result) === 1;
+  }
+
+  async getFailureCount(key: string): Promise<number> {
+    const raw = await this.redis.get(FAIL_PREFIX + key);
+    return raw === null ? 0 : Number(raw);
   }
 
   private async countKeys(pattern: string): Promise<number> {
@@ -333,6 +381,65 @@ export class PostgresBruteForceStore implements BruteForceStore {
     `);
   }
 
+  async clearFailuresIfNotBlocked(key: string): Promise<boolean> {
+    const keyHash = hashBruteForceKey(key);
+    const updated = await this.database.execute(sql`
+      UPDATE api_key_brute_force
+      SET failure_count = 0,
+          window_started_at = NOW(),
+          updated_at = NOW()
+      WHERE key_hash = ${keyHash}
+        AND (blocked_until IS NULL OR blocked_until <= NOW())
+        AND failure_count < ${this.maxFailedAttempts}
+      RETURNING key_hash
+    `);
+    if (updated.rows.length > 0) return true;
+
+    const existing = await this.database.execute(sql`
+      SELECT failure_count, blocked_until
+      FROM api_key_brute_force
+      WHERE key_hash = ${keyHash}
+      LIMIT 1
+    `);
+    const row = existing.rows[0] as Record<string, unknown> | undefined;
+    if (!row) return true;
+
+    const blockedUntil = row.blocked_until instanceof Date
+      ? row.blocked_until.getTime()
+      : row.blocked_until ? new Date(String(row.blocked_until)).getTime() : null;
+    if (blockedUntil !== null && blockedUntil > Date.now()) return false;
+    return Number(row.failure_count) < this.maxFailedAttempts;
+  }
+
+  async getFailureCount(key: string): Promise<number> {
+    await this.cleanupExpiredRows();
+    const keyHash = hashBruteForceKey(key);
+    const result = await this.database.execute(sql`
+      SELECT failure_count, window_started_at, blocked_until
+      FROM api_key_brute_force
+      WHERE key_hash = ${keyHash}
+      LIMIT 1
+    `);
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    if (!row) return 0;
+
+    const now = Date.now();
+    const blockedUntil = row.blocked_until instanceof Date
+      ? row.blocked_until.getTime()
+      : row.blocked_until ? new Date(String(row.blocked_until)).getTime() : null;
+    const windowStartedAt = row.window_started_at instanceof Date
+      ? row.window_started_at.getTime()
+      : new Date(String(row.window_started_at)).getTime();
+
+    if (
+      (blockedUntil !== null && blockedUntil <= now) ||
+      (blockedUntil === null && now - windowStartedAt >= this.blockDurationMs)
+    ) {
+      return 0;
+    }
+    return Number(row.failure_count);
+  }
+
   async _counterSize(): Promise<number> {
     const result = await this.database.execute(sql`
       SELECT COUNT(*)::int AS count
@@ -464,6 +571,8 @@ export class LazyRedisBruteForceStore implements BruteForceStore {
   async isBlocked(key: string) { return this.withFallback((s) => s.isBlocked(key)); }
   async recordFailure(key: string) { return this.withFallback((s) => s.recordFailure(key)); }
   async clearFailures(key: string) { return this.withFallback((s) => s.clearFailures(key)); }
+  async clearFailuresIfNotBlocked(key: string) { return this.withFallback((s) => s.clearFailuresIfNotBlocked(key)); }
+  async getFailureCount(key: string) { return this.withFallback((s) => s.getFailureCount(key)); }
   async _counterSize() { return this.withFallback((s) => s._counterSize()); }
   async _lockoutSize() { return this.withFallback((s) => s._lockoutSize()); }
 }

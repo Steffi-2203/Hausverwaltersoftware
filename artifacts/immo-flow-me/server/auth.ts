@@ -8,10 +8,15 @@ import zxcvbn from "zxcvbn";
 // Dieser rootDb-Import ist der einzige absichtliche RLS-Bypass im Request-Pfad.
 import { rootDb as db } from "./db";
 import * as schema from "@shared/schema";
-import { eq, and, gte, desc, sql } from "drizzle-orm";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { sendEmail } from "./lib/resend";
 import { createAuditLog, getClientInfo } from "./lib/auditLog";
 import { logger } from "./lib/logger";
+import {
+  type AuthBruteForceProtection,
+  authBruteForce,
+} from "./middleware/authBruteForce";
+import { invalidateUserSessions } from "./lib/sessionInvalidation";
 
 /** Wird geworfen wenn ein DB-Fehler während des Token-Lookups auftritt.
  *  Ermöglicht es dem Aufrufer, zwischen "Token unbekannt" (401) und
@@ -31,7 +36,6 @@ const PASSWORD_RESET_EXPIRY_HOURS = 24;
 const MIN_PASSWORD_LENGTH = 12;
 const ZXCVBN_MIN_SCORE = 3;
 const PASSWORD_HISTORY_COUNT = 5;
-const MAX_LOGIN_ATTEMPTS = 5;
 const LOCKOUT_DURATION_MINUTES = 15;
 
 async function validatePasswordStrength(password: string): Promise<string | null> {
@@ -114,30 +118,6 @@ async function savePasswordToHistory(userId: string, passwordHash: string): Prom
       await db.delete(schema.passwordHistory).where(eq(schema.passwordHistory.id, id));
     }
   }
-}
-
-async function checkAccountLockout(email: string): Promise<{ locked: boolean; remainingMinutes?: number }> {
-  const cutoff = new Date(Date.now() - LOCKOUT_DURATION_MINUTES * 60 * 1000);
-
-  const recentAttempts = await db.select()
-    .from(schema.loginAttempts)
-    .where(and(
-      eq(schema.loginAttempts.email, email.toLowerCase()),
-      eq(schema.loginAttempts.success, false),
-      gte(schema.loginAttempts.attemptedAt, cutoff)
-    ));
-
-  if (recentAttempts.length >= MAX_LOGIN_ATTEMPTS) {
-    const oldestAttempt = recentAttempts.reduce((oldest, a) =>
-      a.attemptedAt! < oldest.attemptedAt! ? a : oldest
-    );
-    const unlockAt = new Date(oldestAttempt.attemptedAt!.getTime() + LOCKOUT_DURATION_MINUTES * 60 * 1000);
-    const remainingMs = unlockAt.getTime() - Date.now();
-    const remainingMinutes = Math.ceil(remainingMs / 60000);
-    return { locked: true, remainingMinutes: Math.max(1, remainingMinutes) };
-  }
-
-  return { locked: false };
 }
 
 async function recordLoginAttempt(email: string, ipAddress: string | null, success: boolean): Promise<void> {
@@ -364,7 +344,10 @@ async function getPendingInviteByEmail(email: string) {
   return result[0];
 }
 
-export function setupAuth(app: Express) {
+export function setupAuth(
+  app: Express,
+  bruteForceProtection: AuthBruteForceProtection = authBruteForce,
+) {
   app.post("/api/auth/register", async (req: Request, res: Response) => {
     try {
       const { email, password, fullName, token } = req.body;
@@ -588,12 +571,11 @@ export function setupAuth(app: Express) {
         return res.status(400).json({ error: "E-Mail und Passwort sind erforderlich" });
       }
 
-      const lockout = await checkAccountLockout(email);
-      if (lockout.locked) {
+      if (await bruteForceProtection.isLoginBlocked(email)) {
         await logAuthEvent(req, 'login_failed', email.toLowerCase(), null, false, { reason: 'account_locked' });
         return res.status(429).json({ 
-          error: `Konto vorübergehend gesperrt. Bitte versuchen Sie es in ${lockout.remainingMinutes} Minute(n) erneut.`,
-          lockedUntilMinutes: lockout.remainingMinutes,
+          error: `Konto vorübergehend gesperrt. Bitte versuchen Sie es in ${LOCKOUT_DURATION_MINUTES} Minute(n) erneut.`,
+          lockedUntilMinutes: LOCKOUT_DURATION_MINUTES,
         });
       }
 
@@ -601,6 +583,7 @@ export function setupAuth(app: Express) {
       
       if (!profile || !profile.passwordHash) {
         console.log(`[AUTH] Login failed: profile not found or no password for ${email.toLowerCase()}`);
+        await bruteForceProtection.recordLoginFailure(email);
         await recordLoginAttempt(email, ipAddress, false);
         await logAuthEvent(req, 'login_failed', email.toLowerCase(), null, false, { reason: 'unknown_email' });
         return res.status(401).json({ error: "Ungültige E-Mail oder Passwort" });
@@ -610,11 +593,17 @@ export function setupAuth(app: Express) {
       
       if (!isValid) {
         console.log(`[AUTH] Login failed: wrong password for ${email.toLowerCase()}, hash prefix: ${profile.passwordHash.substring(0, 7)}`);
+        await bruteForceProtection.recordLoginFailure(email);
         await recordLoginAttempt(email, ipAddress, false);
         await logAuthEvent(req, 'login_failed', email.toLowerCase(), profile.id, false, { reason: 'wrong_password' });
 
-        const updatedLockout = await checkAccountLockout(email);
-        const remainingAttempts = MAX_LOGIN_ATTEMPTS - (updatedLockout.locked ? MAX_LOGIN_ATTEMPTS : await getFailedAttemptCount(email));
+        if (await bruteForceProtection.isLoginBlocked(email)) {
+          return res.status(429).json({
+            error: `Konto vorübergehend gesperrt. Bitte versuchen Sie es in ${LOCKOUT_DURATION_MINUTES} Minute(n) erneut.`,
+            lockedUntilMinutes: LOCKOUT_DURATION_MINUTES,
+          });
+        }
+        const remainingAttempts = await bruteForceProtection.remainingLoginAttempts(email);
 
         return res.status(401).json({ 
           error: "Ungültige E-Mail oder Passwort",
@@ -622,6 +611,13 @@ export function setupAuth(app: Express) {
         });
       }
 
+      if (!await bruteForceProtection.completeLoginSuccess(email)) {
+        await logAuthEvent(req, 'login_failed', email.toLowerCase(), profile.id, false, { reason: 'account_locked' });
+        return res.status(429).json({
+          error: `Konto vorübergehend gesperrt. Bitte versuchen Sie es in ${LOCKOUT_DURATION_MINUTES} Minute(n) erneut.`,
+          lockedUntilMinutes: LOCKOUT_DURATION_MINUTES,
+        });
+      }
       await recordLoginAttempt(email, ipAddress, true);
 
       const twoFaRecord = await db.select().from(schema.user2fa)
@@ -969,6 +965,14 @@ window.location.href = '/dashboard';
 
       const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
+      // Passwortänderungen sind sicherheitsrelevant: zuerst alle anderen
+      // Geräte und Bearer-Tokens abmelden. Die auslösende Sitzung darf bleiben,
+      // falls der Reset aus einer bereits authentifizierten Sitzung erfolgt.
+      // Schlägt die Invalidierung fehl, wird das Passwort nicht geändert.
+      const keepSessionId =
+        req.session?.userId === resetToken.userId ? req.sessionID : undefined;
+      await invalidateUserSessions(resetToken.userId, { keepSessionId });
+
       await db.update(schema.profiles)
         .set({ passwordHash, updatedAt: new Date() })
         .where(eq(schema.profiles.id, resetToken.userId));
@@ -987,14 +991,3 @@ window.location.href = '/dashboard';
   });
 }
 
-async function getFailedAttemptCount(email: string): Promise<number> {
-  const cutoff = new Date(Date.now() - LOCKOUT_DURATION_MINUTES * 60 * 1000);
-  const result = await db.select({ count: sql<number>`count(*)` })
-    .from(schema.loginAttempts)
-    .where(and(
-      eq(schema.loginAttempts.email, email.toLowerCase()),
-      eq(schema.loginAttempts.success, false),
-      gte(schema.loginAttempts.attemptedAt, cutoff)
-    ));
-  return Number(result[0]?.count || 0);
-}

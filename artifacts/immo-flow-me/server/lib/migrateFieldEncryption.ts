@@ -10,7 +10,7 @@
  */
 
 import { rootDb } from "../db";
-import { encryptField, isEncrypted } from "./fieldEncryption";
+import { decryptField, encryptField, isEncrypted } from "./fieldEncryption";
 import {
   tenants,
   owners,
@@ -27,6 +27,50 @@ import { logger } from "./logger";
 /** Zeile mit id plus einem oder zwei verschlüsselbaren Feldern. */
 type IbanRow = { id: string; iban?: string | null; bic?: string | null };
 type SingleFieldRow = { id: string; value?: string | null };
+
+/**
+ * Prüft vor einer normalen Boot-Migration, ob der aktuelle Schlüssel alle
+ * vorhandenen Ciphertexte lesen kann. Ohne diesen Check würde die
+ * Klartextmigration enc:v1-Werte überspringen und ein versehentlich geänderter
+ * Schlüssel erst bei einer späteren Fachabfrage als kryptischer GCM-Fehler
+ * auffallen.
+ */
+async function assertCurrentKeyCanReadExistingCiphertexts(): Promise<void> {
+  let unreadable = 0;
+
+  const verify = (
+    rows: Array<{ iban?: string | null; bic?: string | null; value?: string | null }>,
+  ): void => {
+    for (const row of rows) {
+      for (const value of [row.iban, row.bic, row.value]) {
+        if (!value || !isEncrypted(value)) continue;
+        try {
+          decryptField(value);
+        } catch {
+          unreadable++;
+        }
+      }
+    }
+  };
+
+  verify(await rootDb.select({ iban: bankAccounts.iban, bic: bankAccounts.bic }).from(bankAccounts));
+  verify(await rootDb.select({ iban: tenants.iban, bic: tenants.bic }).from(tenants));
+  verify(await rootDb.select({ iban: owners.iban, bic: owners.bic }).from(owners));
+  verify(await rootDb.select({ iban: organizations.iban, bic: organizations.bic }).from(organizations));
+  verify(await rootDb.select({ iban: contractors.iban, bic: contractors.bic }).from(contractors));
+  verify(await rootDb.select({ iban: ebicsConnections.iban, bic: ebicsConnections.bic }).from(ebicsConnections));
+  verify(await rootDb.select({ value: transactions.partnerIban }).from(transactions));
+  verify(await rootDb.select({ value: kautionen.treuhandkontoIban }).from(kautionen));
+
+  if (unreadable > 0) {
+    throw new Error(
+      `[fieldEncryption] ${unreadable} vorhandene(r) enc:v1-Ciphertext(e) ist/sind mit ` +
+      `FIELD_ENCRYPTION_KEY nicht lesbar. Der Schlüssel wurde vermutlich geändert. ` +
+      `Setze den bisherigen Schlüssel als FIELD_ENCRYPTION_KEY_OLD und starte erneut, ` +
+      `damit die Schlüsselrotation die Bestandsdaten sicher umschlüsseln kann.`,
+    );
+  }
+}
 
 /**
  * Verschlüsselt IBAN/BIC-Felder einer Tabelle.
@@ -124,8 +168,11 @@ export async function migrateFieldEncryption(): Promise<void> {
   // fehlgeschlagene Verifikation brechen den Boot ab (Fail-Closed), damit
   // _OLD nicht entfernt wird solange alt-verschlüsselte Werte übrig sind.
   const oldKeyEnv = process.env.FIELD_ENCRYPTION_KEY_OLD;
+  const hasDistinctOldKey = Boolean(
+    oldKeyEnv && oldKeyEnv !== process.env.FIELD_ENCRYPTION_KEY,
+  );
   if (oldKeyEnv) {
-    if (oldKeyEnv === process.env.FIELD_ENCRYPTION_KEY) {
+    if (!hasDistinctOldKey) {
       logger.warn(
         "[fieldEncryption] FIELD_ENCRYPTION_KEY_OLD ist identisch mit FIELD_ENCRYPTION_KEY — " +
         "Rotation bereits abgeschlossen? _OLD entfernen.",
@@ -158,6 +205,11 @@ export async function migrateFieldEncryption(): Promise<void> {
         );
       }
     }
+  }
+
+  if (!hasDistinctOldKey) {
+    logger.info("[fieldEncryption] Prüfe, ob der aktuelle Schlüssel Bestands-Ciphertexte lesen kann...");
+    await assertCurrentKeyCanReadExistingCiphertexts();
   }
 
   logger.info("[fieldEncryption] Prüfe auf unverschlüsselte IBAN-Felder...");

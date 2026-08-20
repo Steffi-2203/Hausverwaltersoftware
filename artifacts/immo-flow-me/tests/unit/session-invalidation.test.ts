@@ -31,7 +31,8 @@ const ORG_ID = randomUUID();
 const ADMIN = randomUUID();   // deaktiviert 2FA in Session A
 const ADMIN2 = randomUUID();  // Admin MIT 2FA — löst die Rollenänderung aus
 const MEMBER = randomUUID();  // verliert Rolle → alle Sessions weg
-const ALL = [ADMIN, ADMIN2, MEMBER];
+const RESET_USER = randomUUID(); // setzt Passwort zurück → andere Sessions weg
+const ALL = [ADMIN, ADMIN2, MEMBER, RESET_USER];
 const PASSWORD = "E2e!Sess-Passwort-2026-lang";
 
 function totpFor(secret: string): string {
@@ -111,6 +112,7 @@ describe("Cross-Session-Invalidierung bei 2FA-Disable und Rollenänderung", () =
       [ADMIN, "admin", "admin"],
       [ADMIN2, "admin", "admin2"],
       [MEMBER, "viewer", "member"],
+      [RESET_USER, "viewer", "reset"],
     ] as const) {
       await rootDb.insert(schema.profiles).values({
         id,
@@ -134,6 +136,7 @@ describe("Cross-Session-Invalidierung bei 2FA-Disable und Rollenänderung", () =
     for (const id of ALL) {
       await rootDb.delete(schema.user2fa).where(eq(schema.user2fa.userId, id));
       await rootDb.delete(schema.passwordResetTokens).where(eq(schema.passwordResetTokens.userId, id));
+      await rootDb.delete(schema.passwordHistory).where(eq(schema.passwordHistory.userId, id));
       await rootDb.delete(schema.authTokens).where(eq(schema.authTokens.userId, id));
       await rootDb.delete(schema.userRoles).where(eq(schema.userRoles.userId, id));
       await rootDb.execute(sql`DELETE FROM user_sessions WHERE sess->>'userId' = ${id}`);
@@ -221,5 +224,45 @@ describe("Cross-Session-Invalidierung bei 2FA-Disable und Rollenänderung", () =
       .get("/api/auth/user")
       .set("Authorization", `Bearer ${bearerM}`);
     assert.equal(byToken.status, 401);
+  });
+
+  test("Passwort-Reset invalidiert andere Sessions und Bearer-Tokens, behält aber die auslösende Sitzung", async () => {
+    const app = await makeFullApp();
+    const agentA = request.agent(app);
+    const agentB = request.agent(app);
+
+    const loginA = await agentA
+      .post("/api/auth/magic-login-api")
+      .send({ token: await seedMagicToken(RESET_USER) });
+    assert.equal(loginA.status, 200, JSON.stringify(loginA.body));
+    const bearerA = loginA.body.token as string;
+
+    const loginB = await agentB
+      .post("/api/auth/magic-login-api")
+      .send({ token: await seedMagicToken(RESET_USER) });
+    assert.equal(loginB.status, 200, JSON.stringify(loginB.body));
+    const bearerB = loginB.body.token as string;
+    assert.equal((await agentB.get("/api/auth/user")).status, 200);
+
+    const resetToken = await seedMagicToken(RESET_USER);
+    const reset = await agentA
+      .post("/api/auth/reset-password")
+      .send({ token: resetToken, password: "Reset!Passwort-2026-lang" });
+    assert.equal(reset.status, 200, JSON.stringify(reset.body));
+
+    // Andere Cookie-Sessions und alle langlebigen Bearer-Tokens sind sofort
+    // ungültig.
+    assert.equal((await agentB.get("/api/auth/user")).status, 401);
+    assert.equal(
+      (await request(app).get("/api/auth/user").set("Authorization", `Bearer ${bearerA}`)).status,
+      401,
+    );
+    assert.equal(
+      (await request(app).get("/api/auth/user").set("Authorization", `Bearer ${bearerB}`)).status,
+      401,
+    );
+
+    // Die Session, aus der der Reset ausgelöst wurde, bleibt erhalten.
+    assert.equal((await agentA.get("/api/auth/user")).status, 200);
   });
 });

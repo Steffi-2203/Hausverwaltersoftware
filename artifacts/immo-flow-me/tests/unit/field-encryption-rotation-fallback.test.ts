@@ -118,6 +118,40 @@ describe("Schlüsselrotation — migrateFieldEncryption (DB)", () => {
   const acctId = uuidv4();
   const txId = uuidv4();
 
+  it("bricht bei geändertem Schlüssel ohne _OLD vor dem Start mit Rotationsanweisung ab", async () => {
+    const unreadableOrgId = uuidv4();
+    const unreadableAcctId = uuidv4();
+    const { rootDb } = await import("../../server/db.js");
+    const { sql } = await import("drizzle-orm");
+    const { migrateFieldEncryption } = await import("../../server/lib/migrateFieldEncryption.js");
+    const { acquireEncryptionTestLock, releaseEncryptionTestLock } = await import("../helpers/encryptionTestLock.js");
+    await acquireEncryptionTestLock();
+
+    try {
+      const encWithPreviousKey = encryptFieldWithKey(IBAN, OLD_KEY)!;
+      await rootDb.execute(sql`
+        INSERT INTO organizations (id, name) VALUES (${unreadableOrgId}::uuid, 'Unlesbarer-Schluessel-Org')
+      `);
+      await rootDb.execute(sql`
+        INSERT INTO bank_accounts (id, organization_id, account_name, iban)
+        VALUES (${unreadableAcctId}::uuid, ${unreadableOrgId}::uuid, 'Unlesbares Konto', ${encWithPreviousKey})
+      `);
+
+      // Simuliert die gefährliche Konfigurationsänderung: neuer Key aktiv,
+      // bisheriger Key wurde nicht als FIELD_ENCRYPTION_KEY_OLD mitgegeben.
+      delete process.env.FIELD_ENCRYPTION_KEY_OLD;
+      await assert.rejects(
+        migrateFieldEncryption(),
+        /FIELD_ENCRYPTION_KEY_OLD.*sicher umschlüsseln/i,
+      );
+    } finally {
+      process.env.FIELD_ENCRYPTION_KEY_OLD = OLD_KEY_B64;
+      await rootDb.execute(sql`DELETE FROM bank_accounts WHERE id = ${unreadableAcctId}::uuid`).catch(() => {});
+      await rootDb.execute(sql`DELETE FROM organizations WHERE id = ${unreadableOrgId}::uuid`).catch(() => {});
+      await releaseEncryptionTestLock();
+    }
+  });
+
   it("schlüsselt bank_accounts- und transactions-Bestandsdaten auf den neuen Schlüssel um", async () => {
     // Import erst hier: zieht server/db (braucht DATABASE_URL)
     const { rootDb } = await import("../../server/db.js");

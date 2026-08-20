@@ -17,6 +17,10 @@ import {
   verifyBackupCode,
 } from "../services/twoFactorService";
 import bcrypt from "bcrypt";
+import {
+  type AuthBruteForceProtection,
+  authBruteForce,
+} from "../middleware/authBruteForce";
 
 async function createAuthToken(userId: string): Promise<string> {
   const authToken = crypto.randomBytes(48).toString('hex');
@@ -32,7 +36,10 @@ function is2FASessionValid(req: Request): boolean {
   return !!(req.session as any)?.pending2FAUserId;
 }
 
-export function registerTwoFactorRoutes(app: Express) {
+export function registerTwoFactorRoutes(
+  app: Express,
+  bruteForceProtection: AuthBruteForceProtection = authBruteForce,
+) {
   app.get("/api/2fa/status", isAuthenticated, async (req: Request, res: Response) => {
     try {
       const userId = req.session.userId;
@@ -118,9 +125,18 @@ export function registerTwoFactorRoutes(app: Express) {
 
       if (!record[0]) return res.status(404).json({ error: "2FA wurde noch nicht eingerichtet" });
       if (record[0].isEnabled) return res.status(400).json({ error: "2FA ist bereits aktiviert" });
+      if (await bruteForceProtection.isTwoFactorBlocked(userId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const isValid = verifyToken(record[0].secret, token);
-      if (!isValid) return res.status(400).json({ error: "Ungültiger Code. Bitte versuchen Sie es erneut." });
+      if (!isValid) {
+        await bruteForceProtection.recordTwoFactorFailure(userId);
+        return res.status(400).json({ error: "Ungültiger Code. Bitte versuchen Sie es erneut." });
+      }
+      if (!await bruteForceProtection.completeTwoFactorSuccess(userId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const backupCodes = generateBackupCodes();
       const hashedCodes = backupCodes.map(hashBackupCode);
@@ -160,10 +176,17 @@ export function registerTwoFactorRoutes(app: Express) {
       if (!record[0]?.isEnabled) {
         return res.status(400).json({ error: "2FA ist nicht aktiviert" });
       }
+      if (await bruteForceProtection.isTwoFactorBlocked(pendingUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const isValid = verifyToken(record[0].secret, token);
       if (!isValid) {
+        await bruteForceProtection.recordTwoFactorFailure(pendingUserId);
         return res.status(400).json({ error: "Ungültiger Code. Bitte versuchen Sie es erneut." });
+      }
+      if (!await bruteForceProtection.completeTwoFactorSuccess(pendingUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
       }
 
       await db
@@ -228,10 +251,17 @@ export function registerTwoFactorRoutes(app: Express) {
       if (!record[0]?.isEnabled || !record[0].backupCodes) {
         return res.status(400).json({ error: "Keine Backup-Codes verfügbar" });
       }
+      if (await bruteForceProtection.isTwoFactorBlocked(pendingUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const { valid, remainingCodes } = verifyBackupCode(record[0].backupCodes, code);
       if (!valid) {
+        await bruteForceProtection.recordTwoFactorFailure(pendingUserId);
         return res.status(400).json({ error: "Ungültiger Backup-Code" });
+      }
+      if (!await bruteForceProtection.completeTwoFactorSuccess(pendingUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
       }
 
       await db
@@ -351,10 +381,17 @@ export function registerTwoFactorRoutes(app: Express) {
 
       if (!record[0]) return res.status(404).json({ error: "2FA wurde noch nicht eingerichtet" });
       if (record[0].isEnabled) return res.status(400).json({ error: "2FA ist bereits aktiviert" });
+      if (await bruteForceProtection.isTwoFactorBlocked(enrollUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const isValid = verifyToken(record[0].secret, token);
       if (!isValid) {
+        await bruteForceProtection.recordTwoFactorFailure(enrollUserId);
         return res.status(400).json({ error: "Ungültiger Code. Bitte versuchen Sie es erneut." });
+      }
+      if (!await bruteForceProtection.completeTwoFactorSuccess(enrollUserId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
       }
 
       const backupCodes = generateBackupCodes();
@@ -437,10 +474,17 @@ export function registerTwoFactorRoutes(app: Express) {
       if (!record[0]?.isEnabled) {
         return res.status(400).json({ error: "2FA ist nicht aktiviert" });
       }
+      if (await bruteForceProtection.isTwoFactorBlocked(userId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
+      }
 
       const isValid = verifyToken(record[0].secret, token);
       if (!isValid) {
+        await bruteForceProtection.recordTwoFactorFailure(userId);
         return res.status(400).json({ error: "Ungültiger 2FA-Code" });
+      }
+      if (!await bruteForceProtection.completeTwoFactorSuccess(userId)) {
+        return res.status(429).json({ error: "Zu viele ungültige 2FA-Codes. Bitte warten Sie 15 Minuten." });
       }
 
       // Fail-closed-Reihenfolge: ZUERST alle fremden Sitzungen und sämtliche
