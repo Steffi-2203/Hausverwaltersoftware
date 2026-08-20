@@ -4,6 +4,7 @@ import { storage } from "./storage";
 import { decryptIbanRows } from "./lib/fieldEncryption";
 import { sendEmail } from "./lib/resend";
 import OpenAI from "openai";
+import { randomUUID } from "crypto";
 import { invoiceService } from "./services/invoiceService";
 import { ocrCircuitBreaker, CircuitOpenError } from "./services/circuitBreaker";
 
@@ -774,7 +775,7 @@ Expense Types: strom, gas, wasser, heizung, muellabfuhr, hausreinigung, hausbetr
         (val.fehler?.length ?? 0) > 0 ||
         (val.unsichere_felder?.length ?? 0) > 0;
 
-      res.json({ data, needs_review: needsReview });
+      res.json({ data, needs_review: needsReview, ocrDocumentId: randomUUID() });
     } catch (error) {
       if (error instanceof CircuitOpenError) {
         return res.status(503).json({
@@ -878,7 +879,7 @@ confidence_score: 0.0–1.0. Setze ihn niedrig (< 0.7) wenn Felder unleserlich o
         (valT.fehler?.length ?? 0) > 0 ||
         (valT.unsichere_felder?.length ?? 0) > 0;
 
-      res.json({ data, needs_review: needsReviewT });
+      res.json({ data, needs_review: needsReviewT, ocrDocumentId: randomUUID() });
     } catch (error) {
       if (error instanceof CircuitOpenError) {
         return res.status(503).json({

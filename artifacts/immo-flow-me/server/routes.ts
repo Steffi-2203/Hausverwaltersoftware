@@ -1,4 +1,5 @@
 import type { Express, Request, Response, NextFunction } from "express";
+import { randomUUID } from "crypto";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { db, rootDb, withOrgContext } from "./db";
@@ -3150,49 +3151,10 @@ Antworte NUR mit dem JSON-Objekt, ohne zusätzlichen Text.`
         (kiVal.fehler?.length ?? 0) > 0 ||
         (kiVal.unsichere_felder?.length ?? 0) > 0;
 
-      res.json({ ...parsed, needs_review: kiNeedsReview });
+      res.json({ ...parsed, needs_review: kiNeedsReview, ocrDocumentId: randomUUID() });
     } catch (error) {
       console.error("KI Invoice OCR error:", error);
       res.status(500).json({ error: "Fehler bei der Rechnungserkennung" });
-    }
-  });
-
-  app.post("/api/ki/invoice-ocr/confirm", isAuthenticated, async (req: any, res) => {
-    try {
-      if (!(await requireKiAutopilot(req, res))) return;
-
-      const profile = await getProfileFromSession(req);
-      if (!profile?.organizationId) return res.status(400).json({ error: "Keine Organisation gefunden" });
-
-      const { lieferant, rechnungsnummer, rechnungsdatum, bruttobetrag, nettobetrag, ustBetrag, ustSatz, beschreibung, kategorie, propertyId } = req.body;
-
-      if (!propertyId) {
-        return res.status(400).json({ error: 'Bitte wählen Sie eine Liegenschaft aus' });
-      }
-
-      const property = await db.select().from(schema.properties)
-        .where(and(eq(schema.properties.id, propertyId), eq(schema.properties.organizationId, profile.organizationId))).limit(1);
-      if (!property[0]) {
-        return res.status(403).json({ error: 'Keine Berechtigung für diese Liegenschaft' });
-      }
-
-      const invoiceDate = rechnungsdatum ? new Date(rechnungsdatum) : new Date();
-      const [expense] = await db.insert(schema.expenses).values({
-        propertyId,
-        category: 'betriebskosten_umlagefaehig',
-        bezeichnung: `${lieferant || 'Rechnung'}: ${beschreibung || rechnungsnummer || 'Keine Beschreibung'}`,
-        betrag: String(bruttobetrag || 0),
-        datum: rechnungsdatum || new Date().toISOString().split('T')[0],
-        belegNummer: rechnungsnummer || null,
-        year: invoiceDate.getFullYear(),
-        month: invoiceDate.getMonth() + 1,
-        notizen: `KI-erkannt: Lieferant: ${lieferant}, Netto: ${nettobetrag}, USt: ${ustBetrag} (${ustSatz}%)`,
-      }).returning();
-
-      res.json(expense);
-    } catch (error) {
-      console.error("KI Invoice confirm error:", error);
-      res.status(500).json({ error: "Fehler beim Erstellen der Buchung" });
     }
   });
 

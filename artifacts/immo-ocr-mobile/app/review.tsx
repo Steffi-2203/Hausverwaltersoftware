@@ -53,6 +53,13 @@ interface FormState {
   beschreibung:    string;
 }
 
+interface PropertyOption {
+  id: string;
+  name?: string | null;
+  address?: string | null;
+  city?: string | null;
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function ReviewScreen() {
@@ -62,10 +69,29 @@ export default function ReviewScreen() {
   const { currentScan, setCurrentScan, apiRequest, user, refreshPendingCount } = useAuth();
 
   const [saving, setSaving] = useState(false);
+  const [properties, setProperties] = useState<PropertyOption[]>([]);
+  const [propertyId, setPropertyId] = useState('');
+  const [loadingProperties, setLoadingProperties] = useState(true);
 
   // Guard: no scan → go back
   useEffect(() => {
     if (!currentScan) router.back();
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void (async () => {
+      try {
+        const response = await apiRequest('/api/properties');
+        const payload = await response.json().catch(() => []);
+        if (active && response.ok) {
+          setProperties(Array.isArray(payload) ? payload : payload.data ?? []);
+        }
+      } finally {
+        if (active) setLoadingProperties(false);
+      }
+    })();
+    return () => { active = false; };
   }, []);
 
   const data = currentScan?.data;
@@ -168,7 +194,37 @@ export default function ReviewScreen() {
         }
       }
 
+      if (!propertyId) {
+        Alert.alert('Liegenschaft erforderlich', 'Bitte wählen Sie die Liegenschaft, der diese Eingangsrechnung zugeordnet werden soll.');
+        return;
+      }
+
+      const transferResponse = await apiRequest('/api/ocr/invoice-transfer', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...form,
+          propertyId,
+          ocrDocumentId: currentScan?.ocrDocumentId ?? currentScan?.fileName,
+          nettobetrag: data?.netto_betrag,
+          ustBetrag: data?.ust_betrag,
+          ustSatz: data?.ust_satz,
+          source: 'mobile_ocr',
+          originalData: original,
+        }),
+      });
+      const transfer = await transferResponse.json().catch(() => ({}));
+      if (!transferResponse.ok) {
+        throw new Error(transfer.error ?? 'Die Rechnung konnte nicht in die Buchhaltung übernommen werden.');
+      }
+
       setCurrentScan(null);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert(
+        transfer.alreadyTransferred ? 'Bereits übernommen' : 'In Buchhaltung übernommen',
+        transfer.alreadyTransferred
+          ? 'Dieser OCR-Vorgang war bereits als Eingangsrechnung, Buchung und Kostenposition gespeichert.'
+          : 'Eingangsrechnung, Journalsatz und Kostenposition wurden erfolgreich gespeichert.',
+      );
       router.back();
     } catch (err: any) {
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
@@ -268,6 +324,36 @@ export default function ReviewScreen() {
                  uncertain={isUnsicher('expense_type')}     colors={colors} />
           <Field label="Beschreibung"      value={form.beschreibung}    onChange={v => setField('beschreibung', v)}
                  uncertain={isUnsicher('beschreibung')}     colors={colors} multiline />
+
+          <View style={fieldStyles.wrapper}>
+            <Text style={[fieldStyles.label, { color: colors.mutedForeground }]}>Liegenschaft für Buchhaltung</Text>
+            {loadingProperties ? (
+              <ActivityIndicator color={colors.primary} style={{ marginVertical: 12 }} />
+            ) : properties.length === 0 ? (
+              <Text style={[styles.sectionSub, { color: colors.mutedForeground }]}>Keine Liegenschaft verfügbar.</Text>
+            ) : (
+              <View style={styles.propertyChoices}>
+                {properties.map(property => {
+                  const selected = property.id === propertyId;
+                  return (
+                    <Pressable
+                      key={property.id}
+                      onPress={() => setPropertyId(property.id)}
+                      style={[styles.propertyChoice, {
+                        borderColor: selected ? colors.primary : colors.border,
+                        backgroundColor: selected ? `${colors.primary}18` : colors.input,
+                      }]}
+                    >
+                      <Feather name={selected ? 'check-circle' : 'circle'} size={16} color={selected ? colors.primary : colors.mutedForeground} />
+                      <Text style={[styles.propertyChoiceText, { color: colors.foreground }]}>
+                        {property.name || property.address || 'Liegenschaft'}{property.city ? `, ${property.city}` : ''}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            )}
+          </View>
         </View>
 
         {/* ── Actions ───────────────────────────────────── */}
@@ -284,7 +370,7 @@ export default function ReviewScreen() {
             ? <ActivityIndicator color="#FFFFFF" />
             : <>
                 <Feather name="check-circle" size={18} color="#FFFFFF" />
-                <Text style={styles.primaryBtnText}>Korrekturen speichern & Fertig</Text>
+                <Text style={styles.primaryBtnText}>Prüfen & in Buchhaltung übernehmen</Text>
               </>
           }
         </Pressable>
@@ -481,4 +567,10 @@ const makeStyles = (colors: ReturnType<typeof useColors>, insets: ReturnType<typ
       fontSize: 15,
       fontFamily: 'Inter_400Regular',
     },
+    propertyChoices: { gap: 8, marginTop: 8 },
+    propertyChoice: {
+      minHeight: 44, borderWidth: 1, borderRadius: 8, paddingHorizontal: 12,
+      paddingVertical: 10, flexDirection: 'row', alignItems: 'center', gap: 8,
+    },
+    propertyChoiceText: { flex: 1, fontSize: 14, fontFamily: 'Inter_400Regular' },
   });

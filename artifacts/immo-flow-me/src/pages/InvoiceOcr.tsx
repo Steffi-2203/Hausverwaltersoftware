@@ -28,6 +28,15 @@ interface ExtractedInvoice {
   kategorie: string;
   needs_review?: boolean;
   validierung?: ValidationReport;
+  ocrDocumentId?: string;
+}
+
+interface TransferResult {
+  created: boolean;
+  alreadyTransferred: boolean;
+  incomingInvoiceId: string;
+  journalEntryId: string;
+  expenseId: string;
 }
 
 export default function InvoiceOcr() {
@@ -39,6 +48,8 @@ export default function InvoiceOcr() {
   const [extracted, setExtracted] = useState<ExtractedInvoice | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [transferResult, setTransferResult] = useState<TransferResult | null>(null);
+  const originalExtractedRef = useRef<ExtractedInvoice | null>(null);
 
   const { data: properties } = useQuery<any[]>({
     queryKey: ['/api/properties'],
@@ -86,6 +97,7 @@ export default function InvoiceOcr() {
 
     setUploading(true);
     setExtracted(null);
+    setTransferResult(null);
 
     try {
       const csrfMatch = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
@@ -108,6 +120,7 @@ export default function InvoiceOcr() {
 
       const data = await response.json();
       setExtracted(data);
+      originalExtractedRef.current = data;
     } catch {
       toast({ title: 'Fehler', description: 'Rechnung konnte nicht analysiert werden.', variant: 'destructive' });
     } finally {
@@ -126,20 +139,36 @@ export default function InvoiceOcr() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (csrfToken) headers['x-csrf-token'] = csrfToken;
 
-      const response = await fetch('/api/ki/invoice-ocr/confirm', {
+      const response = await fetch('/api/ocr/invoice-transfer', {
         method: 'POST',
         headers,
         credentials: 'include',
-        body: JSON.stringify({ ...extracted, propertyId: selectedProperty || undefined }),
+        body: JSON.stringify({
+          ...extracted,
+          propertyId: selectedProperty || undefined,
+          source: 'web_ocr',
+          originalData: originalExtractedRef.current,
+        }),
       });
 
-      if (!response.ok) throw new Error('Buchung fehlgeschlagen');
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Buchung fehlgeschlagen');
 
-      toast({ title: 'Buchung erstellt', description: 'Die Rechnung wurde als Ausgabe erfasst.' });
-      setExtracted(null);
+      setTransferResult(result);
+      toast({
+        title: result.alreadyTransferred ? 'Bereits übernommen' : 'Buchhaltung vollständig erstellt',
+        description: result.alreadyTransferred
+          ? 'Dieser OCR-Vorgang war bereits als Eingangsrechnung, Buchung und Kostenposition gespeichert.'
+          : 'Eingangsrechnung, Journalsatz und abrechnungsrelevante Kostenposition wurden erstellt.',
+      });
       queryClient.invalidateQueries({ queryKey: ['/api/expenses'] });
-    } catch {
-      toast({ title: 'Fehler', description: 'Buchung konnte nicht erstellt werden.', variant: 'destructive' });
+      queryClient.invalidateQueries({ queryKey: ['/api/incoming-invoices'] });
+    } catch (error) {
+      toast({
+        title: 'Übernahme nicht möglich',
+        description: error instanceof Error ? error.message : 'Buchung konnte nicht erstellt werden.',
+        variant: 'destructive',
+      });
     } finally {
       setConfirming(false);
     }
@@ -241,6 +270,19 @@ export default function InvoiceOcr() {
               )}
             </CardHeader>
             <CardContent className="space-y-4">
+              {transferResult && (
+                <div className="flex items-start gap-2 rounded-md border border-green-600/40 bg-green-50 p-3 text-sm text-green-900 dark:bg-green-950/30 dark:text-green-100" data-testid="ocr-transfer-result">
+                  <CheckCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <p className="font-medium">
+                      {transferResult.alreadyTransferred ? 'Bereits in der Buchhaltung übernommen.' : 'Erfolgreich in die Buchhaltung übernommen.'}
+                    </p>
+                    <p className="mt-1 text-xs opacity-90">
+                      Eingangsrechnung, Journalsatz und Kostenposition sind verknüpft gespeichert.
+                    </p>
+                  </div>
+                </div>
+              )}
               {/* Fehler & Warnungen */}
               {(fehler.length > 0 || warnungen.length > 0) && (
                 <div className="space-y-2">
@@ -362,7 +404,7 @@ export default function InvoiceOcr() {
                       className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
                       data-testid="select-property"
                     >
-                      <option value="">Keine Zuordnung</option>
+                      <option value="">Liegenschaft auswählen</option>
                       {properties.map((p: any) => (
                         <option key={p.id} value={p.id}>{p.address}, {p.city}</option>
                       ))}
@@ -371,9 +413,9 @@ export default function InvoiceOcr() {
                 )}
               </div>
               <div className="flex justify-end">
-                <Button onClick={handleConfirm} disabled={confirming} data-testid="button-confirm-booking">
+                <Button onClick={handleConfirm} disabled={confirming || Boolean(transferResult)} data-testid="button-confirm-booking">
                   {confirming ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Check className="mr-2 h-4 w-4" />}
-                  Buchung erstellen
+                  {transferResult ? 'Bereits übernommen' : 'In Buchhaltung übernehmen'}
                 </Button>
               </div>
             </CardContent>

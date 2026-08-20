@@ -546,6 +546,7 @@ export const expenses = pgTable("expenses", {
   istUmlagefaehig: boolean("ist_umlagefaehig").default(true),
   distributionKeyId: uuid("distribution_key_id").references(() => distributionKeys.id),
   transactionId: uuid("transaction_id").references(() => transactions.id),
+  incomingInvoiceId: uuid("incoming_invoice_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 });
@@ -2701,6 +2702,8 @@ export const incomingInvoices = pgTable("incoming_invoices", {
   paidAt: date("paid_at"),
   paidBy: text("paid_by"),
   createdBy: text("created_by"),
+  ocrDocumentId: text("ocr_document_id"),
+  ocrPayloadHash: text("ocr_payload_hash"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

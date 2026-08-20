@@ -13,3 +13,4 @@
 - [Global-table test races](global-table-test-races.md) — Tests auf globalen Tabellen (vpi_values, audit_logs) racen zwischen parallelen Testprozessen; via pg advisory lock (vpiTestLock.ts / auditLogTestLock.ts) serialisieren
 - [Test-Seed-Muster: eindeutige E-Mails](test-seed-unique-emails.md) — fixe E-Mail + zufällige Profil-ID pro Lauf = ON-CONFLICT-Skip + user_roles-FK-Fehler nach abgebrochenen Läufen; E-Mails pro Lauf eindeutig machen
 - [Artifact API route ownership](artifact-api-route-ownership.md) — IMMO FLOW ME owns `/api`; the standalone health service must stay on a non-overlapping prefix.
+- [Atomic financial audit trail](ocr-accounting-audit-transaction.md) — accounting transfers and their strict HMAC proof must commit or roll back together.

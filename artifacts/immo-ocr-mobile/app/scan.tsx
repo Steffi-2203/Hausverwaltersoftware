@@ -147,6 +147,7 @@ export default function ScanScreen() {
         needs_review: json.needs_review ?? false,
         imageUri,
         fileName:    `ocr_${Date.now().toString()}_${Math.random().toString(36).substring(2, 7)}`,
+        ocrDocumentId: json.ocrDocumentId,
       };
 
       setCurrentScan(scanResult);

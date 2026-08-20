@@ -215,7 +215,7 @@ async function ensureAnchorTable(): Promise<void> {
 
 // ─── Serialised chain append ──────────────────────────────────────────────────
 
-async function appendAuditEntryLocked(params: AuditLogParams): Promise<void> {
+async function appendAuditEntryLocked(params: AuditLogParams, externalTx?: TransactionType): Promise<void> {
   if (!AUDIT_HMAC_KEY) {
     throw new Error(
       "Audit HMAC secret not configured (AUDIT_HMAC_KEY / SESSION_SECRET) — " +
@@ -224,7 +224,7 @@ async function appendAuditEntryLocked(params: AuditLogParams): Promise<void> {
   }
   // Ensure anchor table exists before opening the transaction.
   await ensureAnchorTable();
-  await db.transaction(async (tx) => {
+  const append = async (tx: TransactionType) => {
     // 1. Advisory lock — only one writer proceeds at a time.
     await tx.execute(sql`SELECT pg_advisory_xact_lock(${LOCK_KEY})`);
 
@@ -297,7 +297,12 @@ async function appendAuditEntryLocked(params: AuditLogParams): Promise<void> {
         hwm_hmac   = EXCLUDED.hwm_hmac,
         updated_at = NOW()
     `);
-  });
+  };
+  if (externalTx) {
+    await append(externalTx);
+  } else {
+    await db.transaction(append);
+  }
 }
 
 /**
@@ -329,8 +334,8 @@ export async function createAuditLog(params: AuditLogParams, _tx?: TransactionTy
  * unless the audit entry has been durably committed.
  * Returns a rejected promise (→ 5xx) if the HMAC key is missing or the DB write fails.
  */
-export async function createAuditLogStrict(params: AuditLogParams): Promise<void> {
-  await appendAuditEntryLocked(params);
+export async function createAuditLogStrict(params: AuditLogParams, tx?: TransactionType): Promise<void> {
+  await appendAuditEntryLocked(params, tx);
 }
 
 export async function writeAudit(

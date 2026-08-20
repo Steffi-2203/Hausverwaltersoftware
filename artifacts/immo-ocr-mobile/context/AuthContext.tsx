@@ -26,12 +26,14 @@ export interface OcrData {
   lieferant?: string;
   betrag?: string | number;
   netto_betrag?: string | number;
+  ust_betrag?: string | number;
   datum?: string;
   rechnungsnummer?: string;
   kategorie?: string;
   expense_type?: string;
   beschreibung?: string;
   iban?: string;
+  ust_satz?: string | number;
   validierung: OcrValidierung;
 }
 
@@ -40,6 +42,7 @@ export interface ScanResult {
   needs_review: boolean;
   imageUri: string;
   fileName: string;
+  ocrDocumentId?: string;
 }
 
 export interface AuthUser {
