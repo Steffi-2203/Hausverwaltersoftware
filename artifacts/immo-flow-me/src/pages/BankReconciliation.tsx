@@ -69,12 +69,14 @@ export default function BankReconciliation() {
           next.set(transactionId, [...existing]);
         }
       } else {
-        next.set(transactionId, [...existing, {
+        // A bank transaction represents one payment. Picking a different
+        // invoice is an explicit replacement, never a hidden split.
+        next.set(transactionId, [{
           transactionId,
           invoiceId: match.invoiceId,
           tenantId: match.tenantId || '',
           unitId: match.unitId || '',
-          amount: match.invoiceAmount,
+          amount: txAmount,
         }]);
       }
       return next;
@@ -117,14 +119,14 @@ export default function BankReconciliation() {
   const selectAll = () => {
     const next = new Map<string, ReconciliationAction[]>();
     for (const proposal of proposals) {
-      if (proposal.matches.length > 0) {
+      if (proposal.resolution !== 'ambiguous' && proposal.matches.length > 0) {
         const bestMatch = proposal.matches[0];
         next.set(proposal.transactionId, [{
           transactionId: proposal.transactionId,
           invoiceId: bestMatch.invoiceId,
           tenantId: bestMatch.tenantId || '',
           unitId: bestMatch.unitId || '',
-          amount: bestMatch.invoiceAmount,
+          amount: proposal.amount,
         }]);
       }
     }
@@ -284,6 +286,11 @@ export default function BankReconciliation() {
                     <span className="text-lg font-bold" data-testid={`text-amount-${proposal.transactionId}`}>
                       {formatCurrency(proposal.amount)}
                     </span>
+                    {proposal.resolution === 'ambiguous' && (
+                      <Badge variant="destructive" data-testid={`badge-clarification-${proposal.transactionId}`}>
+                        Manuell klären
+                      </Badge>
+                    )}
                   </div>
                   <p className="text-sm font-medium" data-testid={`text-partner-${proposal.transactionId}`}>
                     {proposal.partnerName || 'Unbekannt'}
@@ -296,6 +303,11 @@ export default function BankReconciliation() {
                   {proposal.bookingText && (
                     <p className="text-xs text-muted-foreground" data-testid={`text-booking-${proposal.transactionId}`}>
                       {proposal.bookingText}
+                    </p>
+                  )}
+                  {proposal.resolution === 'ambiguous' && (
+                    <p className="text-sm text-destructive" data-testid={`text-clarification-${proposal.transactionId}`}>
+                      {proposal.clarificationReason || 'Mehrere gleichwertige Treffer. Bitte genau eine Rechnung wählen.'}
                     </p>
                   )}
                 </div>

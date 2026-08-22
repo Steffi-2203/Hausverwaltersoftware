@@ -388,6 +388,10 @@ export const monthlyInvoices = pgTable("monthly_invoices", {
   vortragHk: numeric("vortrag_hk", { precision: 10, scale: 2 }).default('0'),
   vortragSonstige: numeric("vortrag_sonstige", { precision: 10, scale: 2 }).default('0'),
   runId: uuid("run_id"),
+  /** Herkunft eines einmalig aus einer Jahresabrechnung erzeugten OP. */
+  settlementSourceType: text("settlement_source_type"),
+  /** Detailzeile der BK- oder WEG-Abrechnung; bewusst ohne FK (zwei Quelltabellen). */
+  settlementDetailId: uuid("settlement_detail_id"),
   /** Bereits bezahlter Anteil (bei Status 'teilbezahlt' oder 'bezahlt'). Null = noch nicht gesetzt. */
   paidAmount: numeric("paid_amount", { precision: 10, scale: 2 }),
   /** WEG §31: Monatlicher Rücklagenbeitrag — separat ausgewiesen (Migration: 20260828_monthly_invoices_ruecklage.sql). */
@@ -413,6 +417,9 @@ export const monthlyInvoices = pgTable("monthly_invoices", {
   uniqueIndex("uq_monthly_invoices_weg_plan_month")
     .on(table.wegBudgetPlanId, table.unitId, table.ownerId, table.year, table.month)
     .where(sql`weg_budget_plan_id IS NOT NULL`),
+  uniqueIndex("uq_monthly_invoices_settlement_detail")
+    .on(table.settlementSourceType, table.settlementDetailId)
+    .where(sql`settlement_source_type IS NOT NULL AND settlement_detail_id IS NOT NULL`),
 ]);
 
 export const invoiceLines = pgTable("invoice_lines", {
@@ -447,7 +454,11 @@ export const payments = pgTable("payments", {
   transactionId: uuid("transaction_id"),
   notizen: text("notizen"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("uq_payments_transaction_id")
+    .on(table.transactionId)
+    .where(sql`transaction_id IS NOT NULL`),
+]);
 
 // ====== PAYMENT ALLOCATIONS (Zahlungszuordnungen) ======
 export const paymentAllocations = pgTable("payment_allocations", {
@@ -457,7 +468,9 @@ export const paymentAllocations = pgTable("payment_allocations", {
   appliedAmount: numeric("applied_amount", { precision: 10, scale: 2 }).notNull(),
   allocationType: text("allocation_type").default('miete'),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("uq_payment_allocations_payment_invoice").on(table.paymentId, table.invoiceId),
+]);
 
 export const insertPaymentAllocationSchema = createInsertSchema(paymentAllocations).omit({ id: true, createdAt: true });
 export type PaymentAllocation = typeof paymentAllocations.$inferSelect;
@@ -525,8 +538,17 @@ export const transactions = pgTable("transactions", {
   matchedTenantId: uuid("matched_tenant_id").references(() => tenants.id),
   matchedUnitId: uuid("matched_unit_id").references(() => units.id),
   rawData: jsonb("raw_data"),
+  /** Stabile Identität einer importierten CAMT-Buchung; schützt Wiederholungsimporte. */
+  importHash: text("import_hash"),
+  /** unmatched | ambiguous | matched | ignored | allocation_failed */
+  reconciliationStatus: text("reconciliation_status").default("unmatched").notNull(),
+  reconciliationReason: text("reconciliation_reason"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("uq_transactions_org_import_hash")
+    .on(table.organizationId, table.importHash)
+    .where(sql`import_hash IS NOT NULL`),
+]);
 
 export const expenses = pgTable("expenses", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -593,6 +615,29 @@ export const settlementDetails = pgTable("settlement_details", {
   differenz: numeric("differenz", { precision: 10, scale: 2 }).default('0'),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 });
+
+/** Credit payable to a tenant/owner after a finalised annual settlement. */
+export const settlementCredits = pgTable("settlement_credits", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  organizationId: uuid("organization_id").references(() => organizations.id).notNull(),
+  propertyId: uuid("property_id").references(() => properties.id).notNull(),
+  unitId: uuid("unit_id").references(() => units.id).notNull(),
+  tenantId: uuid("tenant_id").references(() => tenants.id),
+  ownerId: uuid("owner_id").references(() => owners.id),
+  settlementId: uuid("settlement_id").notNull(),
+  settlementSourceType: text("settlement_source_type").notNull(),
+  settlementDetailId: uuid("settlement_detail_id").notNull(),
+  amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+  status: text("status").notNull().default("offen"),
+  faelligAm: date("faellig_am"),
+  settledAt: timestamp("settled_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+}, (table) => [
+  uniqueIndex("uq_settlement_credits_source_detail")
+    .on(table.settlementSourceType, table.settlementDetailId),
+  index("idx_settlement_credits_org_status").on(table.organizationId, table.status),
+]);
 
 export const distributionKeys = pgTable("distribution_keys", {
   id: uuid("id").defaultRandom().primaryKey(),
@@ -1357,6 +1402,10 @@ export const wegVorschreibungen = pgTable("weg_vorschreibungen", {
   faelligAm: date("faellig_am"),
   pdfUrl: text("pdf_url"),
   runId: uuid("run_id"),
+  /** Herkunft eines einmalig aus einer WEG-Jahresabrechnung erzeugten OP. */
+  settlementSourceType: text("settlement_source_type"),
+  /** Detailzeile der WEG-Abrechnung; ohne FK, damit BK/WEG-Quellen vereinheitlicht bleiben. */
+  settlementDetailId: uuid("settlement_detail_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -1369,6 +1418,9 @@ export const wegVorschreibungen = pgTable("weg_vorschreibungen", {
   uniqueIndex("uq_weg_vorschreibungen_owner_month")
     .on(table.propertyId, table.unitId, table.ownerId, table.year, table.month)
     .where(sql`budget_plan_id IS NOT NULL`),
+  uniqueIndex("uq_weg_vorschreibungen_settlement_detail")
+    .on(table.settlementSourceType, table.settlementDetailId)
+    .where(sql`settlement_source_type IS NOT NULL AND settlement_detail_id IS NOT NULL`),
 ]);
 
 export const insertWegVorschreibungSchema = createInsertSchema(wegVorschreibungen)

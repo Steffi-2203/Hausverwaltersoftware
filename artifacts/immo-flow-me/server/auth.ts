@@ -12,6 +12,7 @@ import { eq, and, desc, gt, isNull, sql } from "drizzle-orm";
 import { sendEmail } from "./lib/resend";
 import { createAuditLog, getClientInfo } from "./lib/auditLog";
 import { logger } from "./lib/logger";
+import { getPublicBaseUrl } from "./lib/publicBaseUrl";
 import {
   type AuthBruteForceProtection,
   authBruteForce,
@@ -955,11 +956,7 @@ window.location.href = '/dashboard';
           expiresAt,
         });
 
-        const baseUrl = process.env.NODE_ENV === 'production' 
-          ? 'https://www.immoflowme.at'
-          : process.env.REPLIT_DEV_DOMAIN 
-            ? `https://${process.env.REPLIT_DEV_DOMAIN}` 
-            : 'http://localhost:5000';
+        const baseUrl = getPublicBaseUrl();
         const resetUrl = `${baseUrl}/reset-password?token=${token}`;
         
         await sendEmail({

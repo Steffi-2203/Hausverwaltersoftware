@@ -3,6 +3,7 @@ import { db } from "./db";
 import { storage } from "./storage";
 import { decryptIbanRows } from "./lib/fieldEncryption";
 import { sendEmail } from "./lib/resend";
+import { getPublicBaseUrl } from "./lib/publicBaseUrl";
 import OpenAI from "openai";
 import { randomUUID } from "crypto";
 import { invoiceService } from "./services/invoiceService";
@@ -150,9 +151,9 @@ export function registerFunctionRoutes(app: Express) {
 
   app.post("/api/functions/send-invite", isAuthenticated, async (req: Request, res: Response) => {
     try {
-      const { email, inviteToken, organizationName, role, baseUrl } = req.body;
+      const { email, inviteToken, organizationName, role } = req.body;
       
-      const registrationUrl = `${baseUrl}/register?invite=${inviteToken}`;
+      const registrationUrl = `${getPublicBaseUrl()}/register?invite=${inviteToken}`;
       const roleLabel = ROLE_LABELS[role] || role;
 
       const result = await sendEmail({

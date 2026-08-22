@@ -9,6 +9,7 @@ import crypto from "crypto";
 import bcrypt from "bcrypt";
 import { encryptField } from "../lib/fieldEncryption";
 import { seedDistributionKeysForOrg } from "../seedDistributionKeys";
+import { getPublicBaseUrl } from "../lib/publicBaseUrl";
 
 const DEMO_DURATION_MINUTES = 30;
 
@@ -104,11 +105,7 @@ export async function requestDemoAccess(email: string, ipAddress?: string, userA
       .set({ token, expiresAt, ipAddress, userAgent })
       .where(eq(demoInvites.id, existingInvite[0].id));
     
-    const baseUrl = process.env.REPLIT_DEV_DOMAIN 
-      ? `https://${process.env.REPLIT_DEV_DOMAIN}`
-      : process.env.REPLIT_DOMAINS 
-      ? `https://${process.env.REPLIT_DOMAINS.split(',')[0]}`
-      : 'http://localhost:5000';
+    const baseUrl = getPublicBaseUrl();
 
     const demoUrl = `${baseUrl}/demo/activate?token=${token}`;
     
@@ -137,11 +134,7 @@ export async function requestDemoAccess(email: string, ipAddress?: string, userA
     userAgent,
   });
 
-  const baseUrl = process.env.REPLIT_DEV_DOMAIN 
-    ? `https://${process.env.REPLIT_DEV_DOMAIN}`
-    : process.env.REPLIT_DOMAINS 
-    ? `https://${process.env.REPLIT_DOMAINS.split(',')[0]}`
-    : 'http://localhost:5000';
+  const baseUrl = getPublicBaseUrl();
 
   const demoUrl = `${baseUrl}/demo/activate?token=${token}`;
 

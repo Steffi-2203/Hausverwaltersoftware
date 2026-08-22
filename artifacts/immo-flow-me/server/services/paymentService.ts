@@ -18,6 +18,7 @@ import {
   getEffectiveInvoiceTotal,
   getOutstandingInvoiceAmount,
 } from "./invoiceTotalsService";
+import { fromCents, toCents } from "../lib/money";
 
 interface DunningLevel {
   level: 1 | 2 | 3;
@@ -57,8 +58,15 @@ export class PaymentService {
     reference?: string;
     userId?: string;
     organizationId?: string;
+    /** Bankumsatz, aus dem die Zahlung stammt. Macht Wiederholungen eindeutig. */
+    transactionId?: string;
+    /** Für eine manuell bestätigte Bankzuordnung wird genau diese Rechnung gebucht. */
+    invoiceId?: string;
   }) {
-    const { paymentId, tenantId, amount, bookingDate, paymentType = "ueberweisung", reference, userId, organizationId } = params;
+    const {
+      paymentId, tenantId, amount, bookingDate, paymentType = "ueberweisung",
+      reference, userId, organizationId, transactionId, invoiceId,
+    } = params;
     // Audit-Befund K2: ohne Organisationskontext keine Zuordnung —
     // vorher wurde die Eigentümerprüfung schlicht übersprungen.
     if (!organizationId) {
@@ -68,19 +76,46 @@ export class PaymentService {
     if (!isOwner) {
       throw new Error("Mieter gehört nicht zu dieser Organisation");
     }
-    const roundedAmount = roundMoney(amount);
+    const paymentCents = toCents(amount);
+    if (paymentCents <= 0) throw new Error("Zahlungsbetrag muss positiv sein");
+    const roundedAmount = fromCents(paymentCents);
 
     return await db.transaction(async (tx) => {
       await tx.execute(sql`
-        INSERT INTO payments (id, tenant_id, invoice_id, betrag, buchungs_datum, payment_type, verwendungszweck, created_at)
-        VALUES (${paymentId}, ${tenantId}, NULL, ${roundedAmount}, ${bookingDate ?? sql`now()::date`}, ${paymentType}, ${reference || null}, now())
+        INSERT INTO payments (id, tenant_id, invoice_id, transaction_id, betrag, buchungs_datum, payment_type, verwendungszweck, created_at)
+        VALUES (${paymentId}, ${tenantId}, ${invoiceId || null}, ${transactionId || null}, ${roundedAmount}, ${bookingDate ?? sql`now()::date`}, ${paymentType}, ${reference || null}, now())
         ON CONFLICT (id) DO NOTHING
       `);
+
+      // Alle Allokationspfade sperren zuerst die Zahlung. Damit ist die
+      // Restbetragsermittlung auch bei gleichzeitigen Retry-Aufrufen stabil.
+      const paymentRows: any = await tx.execute(sql`
+        SELECT id, tenant_id, betrag FROM payments WHERE id = ${paymentId} FOR UPDATE
+      `);
+      const persistedPayment = paymentRows.rows?.[0];
+      if (!persistedPayment || persistedPayment.tenant_id !== tenantId) {
+        throw new Error("Zahlung nicht gefunden oder gehört zu einem anderen Mieter");
+      }
+      if (toCents(String(persistedPayment.betrag)) !== paymentCents) {
+        throw new Error("Zahlungsbetrag stimmt nicht mit der bestehenden Buchung überein");
+      }
+      const priorAllocationRows: any = await tx.execute(sql`
+        SELECT COALESCE(SUM(applied_amount::numeric), 0) AS total
+        FROM payment_allocations WHERE payment_id = ${paymentId}
+      `);
+      const priorAllocatedCents = toCents(String(priorAllocationRows.rows?.[0]?.total || 0));
+      let remainingCents = Math.max(0, paymentCents - priorAllocatedCents);
+      if (remainingCents === 0) {
+        return { success: true, paymentId, applied: 0, unapplied: 0, alreadyAllocated: true };
+      }
 
       // Org-Scope (kanonische Kette wie im RLS-Modell): zusätzlich zur
       // org-verifizierten tenant_id muss die Rechnung über ihre EIGENE
       // unit_id → property zur Organisation gehören — bei inkonsistenten
       // Daten (Tenant und Invoice-Unit in verschiedenen Orgs) fail-closed.
+      const targetInvoiceFilter = invoiceId
+        ? sql`AND mi.id = ${invoiceId}`
+        : sql``;
       const invoices = await tx.execute(sql`
         SELECT mi.id, mi.gesamtbetrag, COALESCE(mi.paid_amount, 0) AS paid_amount,
           COALESCE((
@@ -95,28 +130,33 @@ export class PaymentService {
         WHERE mi.tenant_id = ${tenantId}
           AND p.organization_id = ${organizationId}
           AND mi.status IN ('offen','teilbezahlt','ueberfaellig')
+           ${targetInvoiceFilter}
         ORDER BY mi.year, mi.month
         FOR UPDATE OF mi
       `).then(r => r.rows);
+      if (invoiceId && invoices.length !== 1) {
+        throw new Error("Rechnung nicht offen, gehört nicht zum Mieter oder liegt außerhalb der Organisation");
+      }
 
-      let remaining = roundedAmount;
-      let appliedTotal = 0;
+      let appliedTotalCents = 0;
 
       for (const inv of invoices) {
-        if (remaining <= 0) break;
+        if (remainingCents <= 0) break;
 
         const total = getEffectiveInvoiceTotal(
           inv.gesamtbetrag,
           Number(inv.dunning_charges || 0),
         );
-        const paid = roundMoney(Number(inv.paid_amount || 0));
-        const due = roundMoney(total - paid);
-        if (due <= 0) continue;
+        const paidCents = toCents(String(inv.paid_amount || 0));
+        const totalCents = toCents(total);
+        const dueCents = Math.max(0, totalCents - paidCents);
+        if (dueCents <= 0) continue;
 
-        const apply = roundMoney(Math.min(remaining, due));
-        const newPaid = roundMoney(paid + apply);
-        remaining = roundMoney(remaining - apply);
-        appliedTotal = roundMoney(appliedTotal + apply);
+        const applyCents = Math.min(remainingCents, dueCents);
+        const apply = fromCents(applyCents);
+        const newPaid = fromCents(paidCents + applyCents);
+        remainingCents -= applyCents;
+        appliedTotalCents += applyCents;
 
         const invId = inv.id as string;
         const newStatus = newPaid >= total ? "bezahlt" : newPaid > 0 ? "teilbezahlt" : "offen";
@@ -166,6 +206,7 @@ export class PaymentService {
         await tx.execute(sql`
           INSERT INTO payment_allocations (id, payment_id, invoice_id, applied_amount, allocation_type, created_at)
           VALUES (gen_random_uuid(), ${paymentId}, ${inv.id}, ${apply}, 'auto', now())
+          ON CONFLICT (payment_id, invoice_id) DO NOTHING
         `);
 
         await tx.execute(sql`
@@ -174,18 +215,29 @@ export class PaymentService {
         `);
       }
 
-      let unapplied = remaining;
-      if (unapplied > 0) {
+      const unapplied = fromCents(remainingCents);
+      if (remainingCents > 0) {
+        // Ein Überhang bleibt explizit an der bestehenden Zahlung sichtbar.
+        // Eine zweite künstliche Transaktion wäre bei Retry nicht zuverlässig
+        // zu deduplizieren und würde den Bankumsatz doppelt darstellen.
         await tx.execute(sql`
-          INSERT INTO transactions (id, organization_id, bank_account_id, amount, transaction_date, booking_text, created_at)
-          VALUES (gen_random_uuid(), NULL, NULL, ${unapplied}, now()::date, ${'Überzahlung / Gutschrift für Tenant ' + tenantId}, now())
+          UPDATE payments
+          SET notizen = CASE
+            WHEN COALESCE(notizen, '') LIKE ${`%Überhang ${unapplied.toFixed(2)} €%`}::text THEN notizen
+            ELSE trim(concat(COALESCE(notizen, ''), ' ', ${`Überhang ${unapplied.toFixed(2)} € ungeklärt`}::text))
+          END
+          WHERE id = ${paymentId} AND tenant_id = ${tenantId}
         `);
+      }
 
-        // Org-Scope (Defense-in-Depth): payments hat keine organization_id —
-        // Einschränkung auf den org-verifizierten tenant_id (das payment wurde
-        // oben mit genau diesem tenant_id angelegt).
+      if (transactionId) {
         await tx.execute(sql`
-          UPDATE payments SET notizen = COALESCE(notizen, '') || ${' Überzahlung ' + unapplied.toFixed(2) + ' €'} WHERE id = ${paymentId} AND tenant_id = ${tenantId}
+          UPDATE transactions
+          SET is_matched = ${remainingCents === 0},
+              matched_tenant_id = ${tenantId},
+              reconciliation_status = ${remainingCents === 0 ? "matched" : "unmatched"},
+              reconciliation_reason = ${remainingCents === 0 ? "Zahlung vollständig zugeordnet" : "Teilbetrag bzw. Überhang manuell klären"}
+          WHERE id = ${transactionId} AND organization_id = ${organizationId}
         `);
       }
 
@@ -195,7 +247,7 @@ export class PaymentService {
           tenantId,
           paymentId,
           amount: roundedAmount,
-          applied: appliedTotal,
+          applied: fromCents(appliedTotalCents),
           unapplied
         })}::jsonb, now())
       `);
@@ -203,7 +255,7 @@ export class PaymentService {
       return {
         success: true,
         paymentId,
-        applied: appliedTotal,
+        applied: fromCents(appliedTotalCents),
         unapplied,
       };
     });

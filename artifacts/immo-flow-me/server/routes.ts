@@ -41,6 +41,7 @@ import { registerAutomationRoutes } from "./routes/automationRoutes";
 import { registerTwoFactorRoutes } from "./routes/twoFactorRoutes";
 import { invalidateUserSessions } from "./lib/sessionInvalidation";
 import { snakeToCamel } from "./routes/helpers";
+import { getPublicBaseUrl } from "./lib/publicBaseUrl";
 import { registerSignatureRoutes } from "./routes/signatureRoutes";
 import { registerQueryBuilderRoutes } from "./routes/queryBuilderRoutes";
 import ocrRoutes from "./routes/ocrRoutes";
@@ -52,6 +53,7 @@ import { reportSchedules, organizations as orgsTable } from "@shared/schema";
 import { sendScheduledReport, parseNextRun } from "./services/scheduledReportsService";
 import { automatedDunningService } from "./services/automatedDunningService";
 import { getDunningChargesByInvoice, getOutstandingInvoiceAmount } from "./services/invoiceTotalsService";
+import { postSettlementDetail } from "./services/settlementPostingService";
 
 async function getDunningSurchargeMap(invoiceIds: string[]): Promise<Map<string, number>> {
   if (invoiceIds.length === 0) return new Map();
@@ -274,7 +276,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       });
       
       const org = await storage.getOrganization(profile.organizationId);
-      const inviteUrl = `${req.protocol}://${req.get('host')}/register?invite=${token}`;
+      const inviteUrl = `${getPublicBaseUrl()}/register?invite=${token}`;
       
       try {
         const { sendInviteEmail } = await import("./lib/resend");
@@ -598,98 +600,93 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const profile = await getProfileFromSession(req);
       if (!profile?.organizationId) return res.status(400).json({ error: "Keine Organisation" });
-
-      // 1. Settlement laden + Org-Zugehörigkeit prüfen
-      const settRows = await db.select()
-        .from(schema.settlements)
-        .innerJoin(schema.properties, eq(schema.settlements.propertyId, schema.properties.id))
-        .where(and(
-          eq(schema.settlements.id, req.params.id),
-          eq(schema.properties.organizationId, profile.organizationId),
-        ))
-        .limit(1);
-
-      if (!settRows.length) return res.status(404).json({ error: "Abrechnung nicht gefunden" });
-      const { settlements: settlement } = settRows[0] as any;
-
-      if (settlement.status === 'abgeschlossen') {
-        return res.status(409).json({ error: "Abrechnung ist bereits abgeschlossen" });
-      }
-
-      // 2. Detailzeilen laden
-      const details = await db.select()
-        .from(schema.settlementDetails)
-        .where(eq(schema.settlementDetails.settlementId, req.params.id));
-
-      // 3. In Transaktion: Status setzen + OP-Einträge erzeugen
-      const openItemsCreated: string[] = [];
-      await db.transaction(async (tx) => {
-        await tx.update(schema.settlements)
-          .set({ status: 'abgeschlossen', updatedAt: new Date() })
-          .where(eq(schema.settlements.id, req.params.id));
-
-        const today = new Date();
-        const dueDate = new Date(today);
-        dueDate.setDate(dueDate.getDate() + 30);
-        const dueDateStr = dueDate.toISOString().split('T')[0];
-        const nowYear = today.getFullYear();
-        const nowMonth = today.getMonth() + 1;
-
-        for (const detail of details) {
-          const diff = Number(detail.differenz ?? 0);
-          // differenz = vorschuss - ausgabenAnteil
-          // Negative differenz → Mieter hat zu wenig gezahlt → Nachzahlung erforderlich
-          if (diff >= -0.005) continue; // keine Nachzahlung nötig (überbezahlt oder ausgeglichen)
-
-          const nachzahlung = Math.round(Math.abs(diff) * 100) / 100;
-
-          // Einheit für diesen Mieter finden
-          const unitRows = await tx.select()
-            .from(schema.tenants)
-            .where(eq(schema.tenants.id, detail.tenantId))
-            .limit(1);
-          const unitId = unitRows[0]?.unitId;
-          if (!unitId) continue;
-
-          // Offene Position als monthlyInvoice anlegen (§21 Abs.3 MRG)
-          const [opEntry] = await tx.insert(schema.monthlyInvoices).values({
-            unitId,
-            tenantId: detail.tenantId,
-            year: nowYear,
-            month: nowMonth,
-            grundmiete: '0',
-            betriebskosten: String(nachzahlung),
-            heizungskosten: '0',
-            wasserkosten: '0',
-            ust: '0',
-            gesamtbetrag: String(nachzahlung),
-            status: 'offen',
-            faelligAm: dueDateStr,
-            isVacancy: false,
-          }).returning({ id: schema.monthlyInvoices.id });
-
-          if (opEntry?.id) openItemsCreated.push(opEntry.id);
+      const outcome = await db.transaction(async (tx) => {
+        // Statusprüfung liegt unter derselben FOR-UPDATE-Sperre wie die
+        // Folgebelege. Parallelaufrufe sehen daher nie einen halbfertigen Abschluss.
+        const locked: any = await tx.execute(sql`
+          SELECT s.* FROM settlements s
+          JOIN properties p ON p.id = s.property_id
+          WHERE s.id = ${req.params.id} AND p.organization_id = ${profile.organizationId}
+          FOR UPDATE OF s
+        `);
+        const settlement = locked.rows?.[0];
+        if (!settlement) {
+          const error: any = new Error("Abrechnung nicht gefunden");
+          error.status = 404;
+          throw error;
         }
-
+        if (!["berechnet", "versendet", "abgeschlossen"].includes(settlement.status)) {
+          const error: any = new Error("Nur berechnete oder versendete Abrechnungen dürfen abgeschlossen werden");
+          error.status = 409;
+          throw error;
+        }
+        const detailRows: any = await tx.execute(sql`
+          SELECT sd.*, t.unit_id AS tenant_unit_id, u.property_id, p.organization_id
+          FROM settlement_details sd
+          JOIN tenants t ON t.id = sd.tenant_id
+          JOIN units u ON u.id = sd.unit_id
+          JOIN properties p ON p.id = u.property_id
+          WHERE sd.settlement_id = ${req.params.id}
+          FOR UPDATE OF sd
+        `);
+        const details = detailRows.rows || [];
+        if (details.length === 0) throw new Error("Abrechnung enthält keine buchbaren Detailzeilen");
+        if (details.some((detail: any) =>
+          detail.tenant_unit_id !== detail.unit_id ||
+          detail.property_id !== settlement.property_id ||
+          detail.organization_id !== profile.organizationId,
+        )) {
+          const error: any = new Error("Abrechnungsdetails liegen außerhalb der Liegenschaft oder Organisation");
+          error.status = 409;
+          throw error;
+        }
+        const openItemsCreated: string[] = [];
+        const entries: string[] = [];
+        for (const detail of details) {
+          // BK-Differenz ist Vorschuss - Kostenanteil: negatives Vorzeichen
+          // bedeutet Nachzahlung, positive Differenz eine Gutschrift.
+          const result = await postSettlementDetail(tx, {
+            organizationId: profile.organizationId,
+            propertyId: settlement.property_id,
+            unitId: detail.unit_id,
+            tenantId: detail.tenant_id,
+            settlementId: settlement.id,
+            detailId: detail.id,
+            year: Number(settlement.year),
+            balance: -Number(detail.differenz || 0),
+            source: "bk",
+            userId: profile.userId,
+          });
+          if (result.openItemId) openItemsCreated.push(result.openItemId);
+          if (result.journalEntryId) entries.push(result.journalEntryId);
+        }
+        if (settlement.status !== "abgeschlossen") {
+          await tx.execute(sql`
+            UPDATE settlements SET status = 'abgeschlossen', updated_at = now()
+            WHERE id = ${settlement.id}
+          `);
+        }
         await tx.execute(sql`
           INSERT INTO audit_logs (user_id, table_name, record_id, action, new_data, created_at)
           VALUES (
-            ${profile.userId || null}, 'settlements', ${req.params.id},
-            'finalize',
-            ${JSON.stringify({ openItemsCreated: openItemsCreated.length, year: settlement.year })}::jsonb,
+            ${profile.userId || null}, 'settlements', ${settlement.id}, 'finalize',
+            ${JSON.stringify({ openItemsCreated: openItemsCreated.length, journalEntries: entries.length, idempotent: settlement.status === "abgeschlossen" })}::jsonb,
             now()
           )
         `);
+        return { settlement, openItemsCreated, entries, alreadyFinalized: settlement.status === "abgeschlossen" };
       });
 
       res.json({
         success: true,
-        message: `Abrechnung ${settlement.year} abgeschlossen. ${openItemsCreated.length} Nachzahlungs-OP(s) erstellt.`,
-        openItemsCreated,
+        alreadyFinalized: outcome.alreadyFinalized,
+        message: `Abrechnung ${outcome.settlement.year} abgeschlossen. ${outcome.openItemsCreated.length} Abrechnungs-OP(s) erstellt.`,
+        openItemsCreated: outcome.openItemsCreated,
+        journalEntries: outcome.entries,
       });
     } catch (err: any) {
       console.error("[Settlement] Finalize error:", err);
-      res.status(500).json({ error: err.message || "Fehler beim Abschließen der Abrechnung" });
+      res.status(err.status || 500).json({ error: err.message || "Fehler beim Abschließen der Abrechnung" });
     }
   });
 

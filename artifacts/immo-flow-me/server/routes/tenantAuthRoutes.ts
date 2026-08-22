@@ -8,6 +8,7 @@ import { rootDb as db } from "../db";
 import * as schema from "@shared/schema";
 import { eq, and } from "drizzle-orm";
 import { sendEmail } from "../lib/resend";
+import { getPublicBaseUrl } from "../lib/publicBaseUrl";
 
 const SALT_ROUNDS = 10;
 const MIN_PASSWORD_LENGTH = 8;
@@ -232,8 +233,7 @@ export function registerTenantAuthRoutes(app: Express) {
         })
         .where(eq(schema.tenantPortalAccess.id, tenantPortalAccessId));
 
-      const domain = process.env.REPLIT_DOMAINS?.split(',')[0] || 'localhost:5000';
-      const inviteUrl = `https://${domain}/mieter-login?invite=${inviteToken}`;
+      const inviteUrl = `${getPublicBaseUrl()}/mieter-login?invite=${inviteToken}`;
 
       const tenant = await db
         .select()

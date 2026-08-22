@@ -10,6 +10,8 @@ export interface MatchProposal {
   partnerIban: string;
   bookingText: string;
   matches: InvoiceMatch[];
+  resolution?: 'unique' | 'ambiguous';
+  clarificationReason?: string;
 }
 
 export interface InvoiceMatch {

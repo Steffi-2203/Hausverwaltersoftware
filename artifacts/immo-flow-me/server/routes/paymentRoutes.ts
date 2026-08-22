@@ -14,6 +14,9 @@ import { parseCamt053 } from "../services/camt053Service";
 import { generateVorschreibungPdf, type VorschreibungData } from "../services/pdfService";
 import { applyInvoiceStatusRules } from "../lib/invoiceStatusRules";
 import { roundMoney } from "@shared/utils";
+import { createHash } from "crypto";
+import { resolveCamtPayment } from "../services/camtPaymentResolutionService";
+import { requireIncomingBankPayment } from "../services/bankPaymentEligibility";
 
 const router = Router();
 
@@ -644,30 +647,49 @@ router.post("/api/transactions/apply-match", isAuthenticated, requireRole('prope
     const transaction = await storage.getTransaction(transactionId);
     if (!transaction) return res.status(404).json({ error: "Transaktion nicht gefunden" });
 
-    const updateData: any = { isMatched: true };
+    if (invoiceId && tenantId) {
+      // The bank transaction UUID is also the stable payment key. Retrying the
+      // same manual CAMT match therefore re-enters the locked, idempotent
+      // allocation path instead of creating a second payment.
+      const allocation = await paymentService.allocatePayment({
+        paymentId: transactionId,
+        tenantId,
+        invoiceId,
+        // Reject debits before a payment row/allocation can be created.
+        amount: requireIncomingBankPayment(transaction.amount),
+        bookingDate: transaction.transactionDate,
+        paymentType: 'ueberweisung',
+        reference: transaction.reference || transaction.bookingText || 'Manuelle Bankzuordnung',
+        transactionId,
+        organizationId: orgId,
+        userId: profile?.userId,
+      });
+      if (!allocation.success) {
+        return res.status(409).json({ error: "Zahlung konnte nicht vollständig zugeordnet werden" });
+      }
+      if (unitId || categoryId) {
+        await db.update(schema.transactions)
+          .set({
+            ...(unitId ? { matchedUnitId: unitId } : {}),
+            ...(categoryId ? { categoryId } : {}),
+          })
+          .where(and(eq(schema.transactions.id, transactionId), eq(schema.transactions.organizationId, orgId)));
+      }
+      return res.json({ success: true, transactionId, allocation });
+    }
+    if (invoiceId && !tenantId) {
+      return res.status(400).json({ error: "Für die Rechnungszuordnung ist ein Mieter erforderlich" });
+    }
+
+    // Category-only matching has no receivable allocation. It remains an
+    // explicit accounting classification, not a misleading payment match.
+    const updateData: any = { isMatched: true, reconciliationStatus: "matched" };
     if (tenantId) updateData.matchedTenantId = tenantId;
     if (unitId) updateData.matchedUnitId = unitId;
     if (categoryId) updateData.categoryId = categoryId;
-
     await db.update(schema.transactions)
       .set(updateData)
-      .where(eq(schema.transactions.id, transactionId));
-
-    if (invoiceId && tenantId) {
-      try {
-        await storage.createPayment({
-          tenantId,
-          invoiceId,
-          betrag: String(Math.abs(Number(transaction.amount))),
-          buchungsDatum: transaction.transactionDate,
-          paymentType: 'ueberweisung',
-          verwendungszweck: transaction.reference || transaction.bookingText || 'Auto-Zuordnung',
-          transactionId,
-        });
-      } catch (payError) {
-        console.error("Payment creation error:", payError);
-      }
-    }
+      .where(and(eq(schema.transactions.id, transactionId), eq(schema.transactions.organizationId, orgId)));
 
     res.json({ success: true, transactionId });
   } catch (error) {
@@ -725,6 +747,14 @@ router.post("/api/payment-allocations", isAuthenticated, requireRole("property_m
     const payment = await storage.getPayment(validatedData.paymentId);
     if (!payment || !(await verifyInvoiceBelongsToTenant(validatedData.invoiceId, payment.tenantId))) {
       return res.status(403).json({ error: "Access denied - invoice does not belong to payment tenant" });
+    }
+    // The allocation ledger is append-only and now has a source-pair unique
+    // key. A repeated client submission is therefore an idempotent success,
+    // not a 500 from the database constraint.
+    const existing = (await storage.getPaymentAllocationsByPayment(validatedData.paymentId))
+      .find((item: any) => item.invoiceId === validatedData.invoiceId);
+    if (existing) {
+      return res.status(201).json(existing);
     }
     const allocation = await storage.createPaymentAllocation(validatedData);
     res.status(201).json(allocation);
@@ -1803,6 +1833,11 @@ router.post("/api/bank-reconciliation/match", isAuthenticated, requireRole("prop
 
       if (matches.length > 0) {
         matches.sort((a: any, b: any) => b.confidence - a.confidence);
+        const topConfidence = Math.max(...matches.map((match) => match.confidence));
+        const topMatches = matches.filter((match) => match.confidence === topConfidence);
+        // A score is only a suggestion. Several equally good candidates must
+        // stay visibly unresolved until a human picks one.
+        const resolution = topMatches.length === 1 ? "unique" : "ambiguous";
         proposals.push({
           transactionId: tx.id,
           transactionDate: tx.transactionDate,
@@ -1811,6 +1846,10 @@ router.post("/api/bank-reconciliation/match", isAuthenticated, requireRole("prop
           partnerIban: tx.partnerIban || '',
           bookingText: tx.bookingText || '',
           matches,
+          resolution,
+          clarificationReason: resolution === "ambiguous"
+            ? `${topMatches.length} gleichwertige Treffer – bitte Rechnung manuell wählen`
+            : undefined,
         });
       }
     }
@@ -1838,11 +1877,16 @@ router.post("/api/bank-reconciliation/apply", isAuthenticated, requireRole("prop
 
     for (const action of actions) {
       try {
-        const { transactionId, invoiceId, tenantId, unitId, amount } = action;
+        const { transactionId, invoiceId, tenantId, unitId } = action;
 
         const txOwned = await verifyTransactionOwnership(transactionId, orgId);
         if (!txOwned) {
           errors.push(`Transaktion ${transactionId}: gehört nicht zur Organisation`);
+          continue;
+        }
+        const sourceTransaction = await storage.getTransaction(transactionId);
+        if (!sourceTransaction || Number(sourceTransaction.amount) <= 0) {
+          errors.push(`Transaktion ${transactionId}: kein buchbarer Zahlungseingang`);
           continue;
         }
         if (invoiceId) {
@@ -1860,56 +1904,27 @@ router.post("/api/bank-reconciliation/apply", isAuthenticated, requireRole("prop
           }
         }
 
-        const payment = await storage.createPayment({
+        // transactionId is deliberately also the payment id. The unique
+        // transaction_id index plus the allocation service's row lock make a
+        // repeated click or concurrent request return the original posting.
+        const payment = await paymentService.allocatePayment({
+          paymentId: transactionId,
+          transactionId,
           tenantId,
           invoiceId,
-          betrag: String(amount),
-          buchungsDatum: new Date().toISOString().split('T')[0],
+          // Der Betrag stammt ausschließlich vom gespeicherten Bankumsatz,
+          // nie aus dem (manipulierbaren) Browser-Request.
+          amount: Number(sourceTransaction.amount),
+          bookingDate: new Date().toISOString().split('T')[0],
           paymentType: 'ueberweisung',
-          verwendungszweck: `Bank-Abgleich: Transaktion ${transactionId}`,
-          transactionId,
+          reference: `Bank-Abgleich: Transaktion ${transactionId}`,
+          userId: profile?.userId,
+          organizationId: orgId,
         });
-
-        const invoice = await db.select().from(schema.monthlyInvoices)
-          .where(eq(schema.monthlyInvoices.id, invoiceId)).limit(1);
-        if (invoice[0]) {
-          const existingPayments = await storage.getPaymentsByInvoice(invoiceId);
-          const totalPaid = existingPayments.reduce((sum: number, p: any) => sum + Number(p.betrag), 0);
-          const invTotal = Number(invoice[0].gesamtbetrag);
-          const newStatus = totalPaid >= invTotal ? 'bezahlt' : 'teilbezahlt';
-          await db.update(schema.monthlyInvoices)
-            .set({ status: newStatus as any, updatedAt: new Date() })
-            .where(eq(schema.monthlyInvoices.id, invoiceId));
-        }
-
         await db.update(schema.transactions)
-          .set({
-            isMatched: true,
-            matchedTenantId: tenantId,
-            matchedUnitId: unitId,
-          })
-          .where(eq(schema.transactions.id, transactionId));
-
-        try {
-          const { createFinancialAuditEntry } = await import("../services/auditHashService");
-          await createFinancialAuditEntry({
-            action: "bank_reconciliation_applied",
-            entityType: "payment",
-            entityId: payment.id,
-            organizationId: orgId,
-            userId: profile?.userId,
-            data: {
-              transactionId,
-              invoiceId,
-              tenantId,
-              unitId,
-              amount,
-              appliedAt: new Date().toISOString(),
-            },
-          });
-        } catch {}
-
-        results.push({ transactionId, invoiceId, paymentId: payment.id, status: 'success' });
+          .set({ matchedUnitId: unitId || null })
+          .where(and(eq(schema.transactions.id, transactionId), eq(schema.transactions.organizationId, orgId)));
+        results.push({ transactionId, invoiceId, paymentId: transactionId, status: 'success', ...payment });
       } catch (err: any) {
         errors.push(`Transaktion ${action.transactionId}: ${err.message}`);
       }
@@ -1991,25 +2006,108 @@ router.post("/api/bank-import/camt053/apply", isAuthenticated, requireMutationAc
       }
     }
 
-    const created = [];
-    for (const tx of txns) {
+    const created: any[] = [];
+    const duplicateCount = { value: 0 };
+    await db.transaction(async (importTx) => {
+      for (const tx of txns) {
       const signedAmount = tx.creditDebit === 'DBIT'
         ? -Math.abs(tx.amount)
         : Math.abs(tx.amount);
+      const importHash = createHash("sha256").update(JSON.stringify({
+        accountIban: (accountIban || "").replace(/\s/g, "").toUpperCase(),
+        bookingDate: tx.bookingDate || tx.valueDate || "",
+        valueDate: tx.valueDate || "",
+        amount: Number(signedAmount).toFixed(2),
+        creditDebit: tx.creditDebit || "",
+        endToEndId: tx.endToEndId || "",
+        transactionId: tx.transactionId || "",
+        remittanceInfo: tx.remittanceInfo || "",
+        counterpartyName: tx.counterpartyName || "",
+      })).digest("hex");
 
-      const transaction = await db.insert(schema.transactions).values({
-        organizationId: orgId,
-        bankAccountId: resolvedBankAccountId || null,
-        amount: signedAmount.toFixed(2),
-        transactionDate: tx.bookingDate || tx.valueDate,
-        bookingText: tx.remittanceInfo || null,
-        partnerName: tx.counterpartyName || null,
-        partnerIban: encryptField(tx.counterpartyIban || null),
-        reference: tx.endToEndId || tx.remittanceInfo || null,
-        // Redact counterpartyIban from stored rawData to avoid plaintext PII in JSONB
-        rawData: { ...tx, counterpartyIban: undefined, counterpartyBic: undefined },
-      }).returning();
-      created.push({ ...transaction[0], partnerIban: decryptField(transaction[0].partnerIban) });
+      const inserted: any = await importTx.execute(sql`
+        INSERT INTO transactions (
+          organization_id, bank_account_id, amount, transaction_date, booking_text,
+          partner_name, partner_iban, reference, raw_data, import_hash,
+          reconciliation_status, reconciliation_reason
+        )
+        VALUES (
+          ${orgId}, ${resolvedBankAccountId || null}, ${signedAmount.toFixed(2)},
+          ${tx.bookingDate || tx.valueDate}, ${tx.remittanceInfo || null},
+          ${tx.counterpartyName || null}, ${encryptField(tx.counterpartyIban || null)},
+          ${tx.endToEndId || tx.remittanceInfo || null},
+          ${JSON.stringify({ ...tx, counterpartyIban: undefined, counterpartyBic: undefined })}::jsonb,
+          ${importHash}, ${signedAmount > 0 ? "unmatched" : "ignored"},
+          ${signedAmount > 0 ? "Noch keiner Forderung eindeutig zugeordnet" : "Ausgang bzw. keine Forderung"}
+        )
+        ON CONFLICT (organization_id, import_hash) WHERE import_hash IS NOT NULL
+        DO NOTHING
+        RETURNING *
+      `);
+      const row = inserted.rows?.[0];
+      if (!row) {
+        duplicateCount.value += 1;
+        continue;
+      }
+      created.push({ ...row, partnerIban: decryptField(row.partner_iban) });
+      }
+    });
+
+    // CAMT imports are never matched by "first suggestion". Exact amount is
+    // sufficient only if it identifies exactly one still-open invoice.
+    const automaticResults: any[] = [];
+    for (const imported of created.filter((row) => Number(row.amount) > 0)) {
+      const candidates: any = await db.execute(sql`
+        SELECT mi.id, mi.tenant_id, mi.unit_id, mi.gesamtbetrag, COALESCE(mi.paid_amount, 0) AS paid_amount
+        FROM monthly_invoices mi
+        JOIN units u ON u.id = mi.unit_id
+        JOIN properties p ON p.id = u.property_id
+        WHERE p.organization_id = ${orgId}
+          AND mi.status IN ('offen', 'teilbezahlt', 'ueberfaellig')
+      `);
+      const rows = (candidates.rows || []).map((candidate: any) => ({
+        id: candidate.id,
+        tenantId: candidate.tenant_id,
+        unitId: candidate.unit_id,
+        total: Number(candidate.gesamtbetrag),
+        paid: Number(candidate.paid_amount),
+      }));
+      const reference = `${imported.reference || ""} ${imported.booking_text || ""}`.toLowerCase();
+      const resolution = resolveCamtPayment(rows, Number(imported.amount), reference);
+      if (resolution.status !== "matched") {
+        const status = resolution.status;
+        const reason = resolution.reason;
+        await db.update(schema.transactions).set({
+          reconciliationStatus: status,
+          reconciliationReason: reason,
+        }).where(and(eq(schema.transactions.id, imported.id), eq(schema.transactions.organizationId, orgId)));
+        automaticResults.push({ transactionId: imported.id, status, reason });
+        continue;
+      }
+      const candidate = resolution.candidate;
+      try {
+        const allocation = await paymentService.allocatePayment({
+          paymentId: imported.id,
+          transactionId: imported.id,
+          tenantId: candidate.tenantId,
+          invoiceId: candidate.id,
+          amount: Number(imported.amount),
+          bookingDate: imported.transaction_date,
+          paymentType: "ueberweisung",
+          reference: imported.reference || imported.booking_text || undefined,
+          userId: profile?.userId,
+          organizationId: orgId,
+        });
+        await db.update(schema.transactions).set({ matchedUnitId: candidate.unitId })
+          .where(and(eq(schema.transactions.id, imported.id), eq(schema.transactions.organizationId, orgId)));
+        automaticResults.push({ transactionId: imported.id, status: "matched", allocation });
+      } catch (allocationError: any) {
+        await db.update(schema.transactions).set({
+          reconciliationStatus: "allocation_failed",
+          reconciliationReason: allocationError.message || "Zahlung konnte nicht gebucht werden",
+        }).where(and(eq(schema.transactions.id, imported.id), eq(schema.transactions.organizationId, orgId)));
+        automaticResults.push({ transactionId: imported.id, status: "allocation_failed", reason: allocationError.message });
+      }
     }
 
     if (resolvedBankAccountId) {
@@ -2023,8 +2121,10 @@ router.post("/api/bank-import/camt053/apply", isAuthenticated, requireMutationAc
     res.json({
       success: true,
       importedCount: created.length,
+      duplicateCount: duplicateCount.value,
       bankAccountId: resolvedBankAccountId || null,
       transactions: created,
+      reconciliation: automaticResults,
     });
   } catch (error: any) {
     console.error('CAMT.053 apply error:', error);

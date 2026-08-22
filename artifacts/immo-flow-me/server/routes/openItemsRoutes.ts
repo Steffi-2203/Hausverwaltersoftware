@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { isAuthenticated } from "./helpers";
 import { db } from "../db";
-import { monthlyInvoices, units, tenants, properties, payments, paymentAllocations, wegVorschreibungen, owners } from "@shared/schema";
+import { monthlyInvoices, units, tenants, properties, payments, paymentAllocations, wegVorschreibungen, owners, settlementCredits } from "@shared/schema";
 import { eq, ne, and, sql, gte, lte, desc, sum, isNull } from "drizzle-orm";
 import { exportOPListe } from "../services/xlsxExportService";
 import { getDunningChargesByInvoice, getEffectiveInvoiceTotal } from "../services/invoiceTotalsService";
@@ -123,7 +123,50 @@ router.get("/api/open-items", isAuthenticated, async (req: Request, res: Respons
       }));
     }
 
-    res.json([...items, ...wegItems]);
+    const creditConditions: any[] = [
+      eq(settlementCredits.organizationId, orgId),
+      ne(settlementCredits.status, "erledigt"),
+    ];
+    if (propertyId) creditConditions.push(eq(settlementCredits.propertyId, propertyId as string));
+    if (tenantId) creditConditions.push(eq(settlementCredits.tenantId, tenantId as string));
+    if (from) creditConditions.push(gte(settlementCredits.faelligAm, from as string));
+    if (to) creditConditions.push(lte(settlementCredits.faelligAm, to as string));
+    const creditRows = await db.select({
+      credit: settlementCredits,
+      unitTopNummer: units.topNummer,
+      propertyName: properties.name,
+      propertyAddress: properties.address,
+      tenantFirstName: tenants.firstName,
+      tenantLastName: tenants.lastName,
+      ownerFirstName: owners.firstName,
+      ownerLastName: owners.lastName,
+    })
+      .from(settlementCredits)
+      .innerJoin(units, eq(settlementCredits.unitId, units.id))
+      .innerJoin(properties, eq(settlementCredits.propertyId, properties.id))
+      .leftJoin(tenants, eq(settlementCredits.tenantId, tenants.id))
+      .leftJoin(owners, eq(settlementCredits.ownerId, owners.id))
+      .where(and(...creditConditions))
+      .orderBy(desc(settlementCredits.faelligAm));
+    const creditItems = creditRows.map((r) => ({
+      ...r.credit,
+      // The OP list deliberately represents the payable credit as a negative
+      // balance, while the database retains it as a positive credit amount.
+      gesamtbetrag: -Number(r.credit.amount),
+      paid_amount: null,
+      source: "settlement_credit",
+      unitTopNummer: r.unitTopNummer,
+      propertyId: r.credit.propertyId,
+      propertyName: r.propertyName,
+      propertyAddress: r.propertyAddress,
+      tenantName: r.tenantFirstName && r.tenantLastName
+        ? `${r.tenantFirstName} ${r.tenantLastName}`
+        : `${r.ownerFirstName || ""} ${r.ownerLastName || ""}`.trim() || null,
+      tenantEmail: null,
+      creditKind: "Gutschrift aus Jahresabrechnung",
+    }));
+
+    res.json([...items, ...wegItems, ...creditItems]);
   } catch (error: any) {
     console.error("Error fetching open items:", error);
     res.status(500).json({ error: error.message });

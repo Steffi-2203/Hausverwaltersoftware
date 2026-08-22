@@ -6,6 +6,7 @@ import * as schema from "@shared/schema";
 import { getAuthContext, checkMutationPermission, objectToSnakeCase, objectToCamelCase } from "./helpers";
 import { calculateProRata } from "../services/proRataBillingService";
 import { parseMoneyInput } from "../lib/money";
+import { postSettlementDetail } from "../services/settlementPostingService";
 
 const router = Router();
 
@@ -1966,6 +1967,101 @@ router.post("/api/weg/settlement/create", async (req: Request, res: Response) =>
     }
     console.error("Error creating WEG settlement:", error);
     res.status(400).json({ error: error.message || "Fehler beim Erstellen der Abrechnung" });
+  }
+});
+
+// Der Abschluss ist getrennt vom Berechnen: erst hier entstehen OPs und
+// Journalbuchungen. Die Header-Sperre und die stable detail-source IDs machen
+// sowohl Wiederholung als auch parallele Klicks exakt-einmal.
+router.post("/api/weg/settlement/:id/finalize", async (req: Request, res: Response) => {
+  try {
+    const ctx = await getAuthContext(req, res);
+    if (!ctx) return;
+    if (!(await checkMutationPermission(req, res))) return;
+    if (!ctx.orgId) return res.status(403).json({ error: "Keine Organisation zugewiesen" });
+
+    const outcome = await db.transaction(async (tx) => {
+      const locked: any = await tx.execute(sql`
+        SELECT * FROM weg_settlements
+        WHERE id = ${req.params.id} AND organization_id = ${ctx.orgId}
+        FOR UPDATE
+      `);
+      const settlement = locked.rows?.[0];
+      if (!settlement) {
+        const error: any = new Error("Abrechnung nicht gefunden");
+        error.status = 404;
+        throw error;
+      }
+      if (!["berechnet", "versendet", "abgeschlossen"].includes(settlement.status)) {
+        const error: any = new Error("Nur berechnete oder versendete Abrechnungen dürfen abgeschlossen werden");
+        error.status = 409;
+        throw error;
+      }
+      const details: any = await tx.execute(sql`
+        SELECT wsd.*, u.property_id, p.organization_id, o.organization_id AS owner_organization_id
+        FROM weg_settlement_details wsd
+        JOIN units u ON u.id = wsd.unit_id
+        JOIN properties p ON p.id = u.property_id
+        JOIN owners o ON o.id = wsd.owner_id
+        WHERE settlement_id = ${settlement.id}
+        FOR UPDATE OF wsd
+      `);
+      const detailRows = details.rows || [];
+      if (detailRows.length === 0) throw new Error("Abrechnung enthält keine buchbaren Detailzeilen");
+      if (detailRows.some((detail: any) =>
+        detail.property_id !== settlement.property_id ||
+        detail.organization_id !== ctx.orgId ||
+        detail.owner_organization_id !== ctx.orgId,
+      )) {
+        const error: any = new Error("Abrechnungsdetails liegen außerhalb der Liegenschaft oder Organisation");
+        error.status = 409;
+        throw error;
+      }
+      const openItemsCreated: string[] = [];
+      const journalEntries: string[] = [];
+      for (const detail of detailRows) {
+        const result = await postSettlementDetail(tx, {
+          organizationId: ctx.orgId,
+          propertyId: settlement.property_id,
+          unitId: detail.unit_id,
+          ownerId: detail.owner_id,
+          settlementId: settlement.id,
+          detailId: detail.id,
+          year: Number(settlement.year),
+          // WEG saldo = Soll - Ist: positives Vorzeichen = Nachzahlung.
+          balance: Number(detail.saldo || 0),
+          source: "weg",
+          userId: ctx.userId,
+        });
+        if (result.openItemId) openItemsCreated.push(result.openItemId);
+        if (result.journalEntryId) journalEntries.push(result.journalEntryId);
+      }
+      if (settlement.status !== "abgeschlossen") {
+        await tx.execute(sql`
+          UPDATE weg_settlements
+          SET status = 'abgeschlossen', approved_at = COALESCE(approved_at, now()), updated_at = now()
+          WHERE id = ${settlement.id} AND organization_id = ${ctx.orgId}
+        `);
+      }
+      await tx.execute(sql`
+        INSERT INTO audit_logs (user_id, table_name, record_id, action, new_data, created_at)
+        VALUES (
+          ${ctx.userId || null}, 'weg_settlements', ${settlement.id}, 'financial_finalize',
+          ${JSON.stringify({ openItemsCreated: openItemsCreated.length, journalEntries: journalEntries.length, idempotent: settlement.status === "abgeschlossen" })}::jsonb,
+          now()
+        )
+      `);
+      return { settlement, openItemsCreated, journalEntries, alreadyFinalized: settlement.status === "abgeschlossen" };
+    });
+    res.json(objectToSnakeCase({
+      success: true,
+      alreadyFinalized: outcome.alreadyFinalized,
+      openItemsCreated: outcome.openItemsCreated,
+      journalEntries: outcome.journalEntries,
+    }));
+  } catch (error: any) {
+    console.error("Error finalizing WEG settlement:", error);
+    res.status(error.status || 500).json({ error: error.message || "Fehler beim Abschließen der Abrechnung" });
   }
 });
 

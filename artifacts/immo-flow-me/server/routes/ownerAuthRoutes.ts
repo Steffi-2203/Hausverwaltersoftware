@@ -8,6 +8,7 @@ import { rootDb as db } from "../db";
 import * as schema from "@shared/schema";
 import { eq, and } from "drizzle-orm";
 import { sendEmail } from "../lib/resend";
+import { getPublicBaseUrl } from "../lib/publicBaseUrl";
 
 const SALT_ROUNDS = 10;
 const MIN_PASSWORD_LENGTH = 8;
@@ -230,8 +231,7 @@ export function registerOwnerAuthRoutes(app: Express) {
         })
         .where(eq(schema.ownerPortalAccess.id, ownerPortalAccessId));
 
-      const domain = process.env.REPLIT_DOMAINS?.split(',')[0] || 'localhost:5000';
-      const inviteUrl = `https://${domain}/eigentuemer-login?invite=${inviteToken}`;
+      const inviteUrl = `${getPublicBaseUrl()}/eigentuemer-login?invite=${inviteToken}`;
 
       const owner = await db
         .select()

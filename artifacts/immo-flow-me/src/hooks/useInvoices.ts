@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { apiRequest } from '@/lib/queryClient';
 import { toast } from 'sonner';
 import { normalizeFields } from '@/utils/fieldNormalizer';
+import { unwrapList } from '@/utils/unwrapList';
 
 function normalizeInvoice(invoice: any) {
   const normalized = normalizeFields(invoice);

@@ -14,3 +14,4 @@
 - [Test-Seed-Muster: eindeutige E-Mails](test-seed-unique-emails.md) — fixe E-Mail + zufällige Profil-ID pro Lauf = ON-CONFLICT-Skip + user_roles-FK-Fehler nach abgebrochenen Läufen; E-Mails pro Lauf eindeutig machen
 - [Artifact API route ownership](artifact-api-route-ownership.md) — IMMO FLOW ME owns `/api`; the standalone health service must stay on a non-overlapping prefix.
 - [Atomic financial audit trail](ocr-accounting-audit-transaction.md) — accounting transfers and their strict HMAC proof must commit or roll back together.
+- [Ledger-safe legacy deduplication](ledger-safe-legacy-deduplication.md) — uniqueness migrations for append-only allocations need a scoped, atomic maintenance path.

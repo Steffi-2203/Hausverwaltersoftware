@@ -35,6 +35,7 @@ import { organizations, leaseExpiryNotifications } from '@shared/schema';
 import { eq, inArray, and, sql as drizzleSql } from 'drizzle-orm';
 import { sendEmail } from '../lib/resend';
 import { createHash } from 'node:crypto';
+import { getPublicBaseUrl } from '../lib/publicBaseUrl';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -244,9 +245,7 @@ export async function processOrgThreshold(
   if (claimed.length === 0 && reclaimedGroups.length === 0) return;
 
   // ── 3. Batches: eine je reclaimter Key-Gruppe + eine für neue Claims ────
-  const baseUrl = process.env.REPLIT_DEV_DOMAIN
-    ? `https://${process.env.REPLIT_DEV_DOMAIN}`
-    : (process.env.APP_BASE_URL ?? 'https://immoflowme.app');
+  const baseUrl = getPublicBaseUrl();
 
   // Anzeigedaten für reclaimte Gruppen unabhängig vom Kandidaten-Filter laden
   // (Payload soll die ursprüngliche Lease-Menge exakt abbilden).
